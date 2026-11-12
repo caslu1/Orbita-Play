@@ -1,0 +1,193 @@
+import { weTrakrClient } from "./wetrakr";
+import { mdblistClient } from "./mdblist";
+import { simklClient } from "./simkl";
+import { loadStored, saveStored } from "./storage";
+import { traktClient } from "./store";
+
+export type SyncProvider = "trakt" | "mdblist" | "simkl" | "wetrakr" | "none";
+export type TrackingReadMode = "auto" | "trakt" | "simkl" | "both" | "mdblist" | "wetrakr";
+export type TrackingFeature = "watchlist" | "continueWatching" | "watched";
+
+export interface TrackingPreferences {
+  watchlistReadMode: TrackingReadMode;
+  continueWatchingReadMode: TrackingReadMode;
+  watchedReadMode: TrackingReadMode;
+  writeToTrakt: boolean;
+  writeToSimkl: boolean;
+  writeToWeTrakr?: boolean;
+}
+
+export interface SyncMediaRef {
+  mediaType: "movie" | "tv";
+  tmdbId: number;
+  season?: number | null;
+  episode?: number | null;
+  isAnime?: boolean;
+}
+
+export interface SyncClient {
+  readonly isConnected: boolean;
+  readonly currentProfileId?: string | null;
+  watchlist(): Promise<unknown[]>;
+  playback(localWatchedKeys?: Set<string>): Promise<unknown[]>;
+  watched(type: "movies" | "shows", feature?: "watched" | "continueWatching"): Promise<unknown[]>;
+  addToWatchlist(item: SyncMediaRef): Promise<void>;
+  removeFromWatchlist(item: SyncMediaRef): Promise<void>;
+  addToHistory(item: SyncMediaRef): Promise<void>;
+  removeFromHistory(item: SyncMediaRef): Promise<void>;
+  dismissFromContinueWatching(item: SyncMediaRef): Promise<void>;
+  scrobble(action: "start" | "pause" | "stop", item: SyncMediaRef & { progress: number }): Promise<void>;
+}
+
+const preferencesKey = (profileId: string) => `arvio.web.tracking.preferences.v2:${profileId}`;
+
+export function defaultTrackingPreferences(): TrackingPreferences {
+  const trakt = traktClient.isConnected;
+  const simkl = simklClient.isConnected;
+  const mdb = mdblistClient.isConnected;
+  // Trakt is ARVIO's canonical default when it is connected. Android already
+  // follows this rule; defaulting the web client to "both" made a fresh
+  // profile show a mixed Continue Watching rail even though the user expected
+  // the Trakt list. Users can still explicitly select "both" in settings.
+  const mode: TrackingReadMode = trakt ? "trakt" : simkl ? "simkl" : mdb ? "mdblist" : weTrakrClient.isConnected ? "wetrakr" : "auto";
+  return {
+    watchlistReadMode: mode,
+    continueWatchingReadMode: mode,
+    watchedReadMode: mode,
+    writeToTrakt: trakt,
+    writeToWeTrakr: weTrakrClient.isConnected,
+    writeToSimkl: simkl
+  };
+}
+
+export function loadTrackingPreferences(profileId?: string | null): TrackingPreferences {
+  if (!profileId) return defaultTrackingPreferences();
+  return { ...defaultTrackingPreferences(), ...loadStored<Partial<TrackingPreferences>>(preferencesKey(profileId), {}) };
+}
+
+export function saveTrackingPreferences(profileId: string, preferences: TrackingPreferences): TrackingPreferences {
+  saveStored(preferencesKey(profileId), preferences);
+  return preferences;
+}
+
+function readMode(feature: TrackingFeature, profileId?: string | null): TrackingReadMode {
+  const preferences = loadTrackingPreferences(profileId);
+  return feature === "watchlist"
+    ? preferences.watchlistReadMode
+    : feature === "continueWatching"
+      ? preferences.continueWatchingReadMode
+      : preferences.watchedReadMode;
+}
+
+function readClients(feature: TrackingFeature): SyncClient[] {
+  const mode = readMode(feature, simklClient.currentProfileId ?? traktClient.currentProfileId);
+  const result: SyncClient[] = [];
+  if (mode === "auto") {
+    // AUTO means the canonical connected provider, not a merge. A stored
+    // AUTO value is common on older profiles; treating it as BOTH made a
+    // Trakt Continue Watching rail unexpectedly mix in Simkl items.
+    if (traktClient.isConnected) result.push(traktClient as unknown as SyncClient);
+    else if (simklClient.isConnected) result.push(simklClient as unknown as SyncClient);
+    else if (mdblistClient.isConnected) result.push(mdblistClient as unknown as SyncClient);
+    else if (weTrakrClient.isConnected) result.push(weTrakrClient);
+    return result;
+  }
+  if (mode === "wetrakr" && weTrakrClient.isConnected) result.push(weTrakrClient);
+  if (mode === "mdblist" && mdblistClient.isConnected) result.push(mdblistClient as unknown as SyncClient);
+  if ((mode === "trakt" || mode === "both") && traktClient.isConnected) result.push(traktClient as unknown as SyncClient);
+  if ((mode === "simkl" || mode === "both") && simklClient.isConnected) result.push(simklClient as unknown as SyncClient);
+  return result;
+}
+
+function writeClients(profileId = simklClient.currentProfileId ?? traktClient.currentProfileId): SyncClient[] {
+  const preferences = loadTrackingPreferences(profileId);
+  const result: SyncClient[] = [];
+  if (preferences.writeToWeTrakr && weTrakrClient.isConnected) result.push(weTrakrClient);
+  if (preferences.writeToTrakt && traktClient.isConnected) result.push(traktClient as unknown as SyncClient);
+  if (preferences.writeToSimkl && simklClient.isConnected) result.push(simklClient as unknown as SyncClient);
+  if (mdblistClient.isConnected) result.push(mdblistClient as unknown as SyncClient);
+  return result;
+}
+
+export function readsFrom(feature: TrackingFeature, provider: "trakt" | "simkl" | "mdblist" | "wetrakr"): boolean {
+  return readClients(feature).includes(({ trakt: traktClient, simkl: simklClient, mdblist: mdblistClient, wetrakr: weTrakrClient })[provider] as unknown as SyncClient);
+}
+
+export function sameTrackingSources(a: TrackingFeature, b: TrackingFeature): boolean {
+  const first = readClients(a);
+  const second = readClients(b);
+  return first.length === second.length && first.every((client) => second.includes(client));
+}
+
+async function readAll(feature: TrackingFeature, operation: (client: SyncClient) => Promise<unknown[]>): Promise<unknown[]> {
+  const settled = await Promise.allSettled(readClients(feature).map(operation));
+  // A partial snapshot must not be treated as an authoritative deletion.
+  const failed = settled.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failed.length) throw new AggregateError(failed.map((result) => result.reason), "A tracking service could not be read. Your saved library has been kept.");
+  return settled.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+}
+
+async function writeAll(operation: (client: SyncClient) => Promise<void>, profileId?: string | null): Promise<void> {
+  const clients = writeClients(profileId).filter(client => profileId === undefined || client.currentProfileId === profileId);
+  if (!clients.length) return;
+  const settled = await Promise.allSettled(clients.map(operation));
+  const failed = settled.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failed.length) {
+    throw new AggregateError(failed.map((result) => result.reason), "Not all tracking services saved this change. Please retry.");
+  }
+}
+
+export async function syncSeasonWatched(
+  item: SyncMediaRef, season: number, episodes: number[], watched: boolean
+): Promise<void> {
+  if (item.tmdbId <= 0) return;
+  await writeAll(async client => {
+    if (client === simklClient) {
+      await simklClient.markSeasonWatched(item, season, watched);
+      return;
+    }
+    for (const episode of episodes) {
+      const ref = { ...item, season, episode };
+      if (watched) await client.addToHistory(ref);
+      else await client.removeFromHistory(ref);
+    }
+  });
+}
+
+class TrackingRouter implements SyncClient {
+  constructor(private readonly profileId?: string | null) {}
+  get isConnected() { return readClients("watchlist").length > 0 || readClients("continueWatching").length > 0 || readClients("watched").length > 0 || writeClients().length > 0; }
+  watchlist() { return readAll("watchlist", (client) => client.watchlist()); }
+  async playback(localWatchedKeys?: Set<string>) {
+    return readAll("continueWatching", (client) => client.playback(localWatchedKeys));
+  }
+  async watched(type: "movies" | "shows", feature: "watched" | "continueWatching" = "watched") {
+    return readAll(feature, (client) => client.watched(type));
+  }
+  // Ids below 1 (native addon items) have no tracker identity.
+  addToWatchlist(item: SyncMediaRef) { return item.tmdbId > 0 ? writeAll((client) => client.addToWatchlist(item)) : Promise.resolve(); }
+  removeFromWatchlist(item: SyncMediaRef) { return item.tmdbId > 0 ? writeAll((client) => client.removeFromWatchlist(item)) : Promise.resolve(); }
+  addToHistory(item: SyncMediaRef) { return item.tmdbId > 0 ? writeAll((client) => client.addToHistory(item)) : Promise.resolve(); }
+  removeFromHistory(item: SyncMediaRef) { return item.tmdbId > 0 ? writeAll((client) => client.removeFromHistory(item)) : Promise.resolve(); }
+  dismissFromContinueWatching(item: SyncMediaRef) { return item.tmdbId > 0 ? writeAll((client) => client.dismissFromContinueWatching(item)) : Promise.resolve(); }
+  scrobble(action: "start" | "pause" | "stop", item: SyncMediaRef & { progress: number }) {
+    if (!Number.isSafeInteger(item.tmdbId) || item.tmdbId <= 0) return Promise.resolve();
+    if (item.mediaType === "tv" && (!Number.isInteger(item.season) || item.season! < 0 ||
+      !Number.isInteger(item.episode) || item.episode! <= 0)) return Promise.resolve();
+    return writeAll((client) => client.scrobble(action, item), this.profileId);
+  }
+}
+
+const trackingRouter = new TrackingRouter();
+
+export function activeSyncProvider(): SyncProvider {
+  if (traktClient.isConnected) return "trakt";
+  if (simklClient.isConnected) return "simkl";
+  if (mdblistClient.isConnected) return "mdblist";
+  if (weTrakrClient.isConnected) return "wetrakr";
+  return "none";
+}
+
+export function syncClient(profileId?: string | null): SyncClient {
+  return profileId === undefined ? trackingRouter : new TrackingRouter(profileId);
+}

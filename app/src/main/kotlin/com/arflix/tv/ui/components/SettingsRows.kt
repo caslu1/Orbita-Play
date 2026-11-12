@@ -1,0 +1,413 @@
+package com.arflix.tv.ui.components
+
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.annotation.DrawableRes
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.unit.sp
+import androidx.tv.material3.ExperimentalTvMaterial3Api
+import com.arflix.tv.R
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
+import com.arflix.tv.ui.theme.ArflixTypography
+import com.arflix.tv.ui.theme.BackgroundElevated
+import com.arflix.tv.ui.theme.SuccessGreen
+import com.arflix.tv.ui.theme.TextPrimary
+import com.arflix.tv.ui.theme.TextSecondary
+
+/** Display-only localization of stored setting values (Off/Any/Medium/White...).
+ *  The stored/compared value stays English; only the shown label is translated.
+ *  Unknown values (720p, 4K, language/DNS names) pass through unchanged. */
+@Composable
+internal fun localizeSettingValue(value: String?): String {
+    val safeValue = value ?: return ""
+    return when (safeValue) {
+    "Off" -> stringResource(R.string.off)
+    "On" -> stringResource(R.string.on)
+    "Auto" -> stringResource(R.string.auto)
+    "Any" -> stringResource(R.string.settings_value_any)
+    "Always" -> stringResource(R.string.settings_value_always)
+    "Seamless only" -> stringResource(R.string.settings_value_seamless)
+    "Small" -> stringResource(R.string.settings_value_small)
+    "Medium" -> stringResource(R.string.settings_value_medium)
+    "Large" -> stringResource(R.string.settings_value_large)
+    "Extra Large" -> stringResource(R.string.settings_value_extra_large)
+    "White" -> stringResource(R.string.settings_value_white)
+    "Red" -> stringResource(R.string.settings_value_red)
+    "Orange" -> stringResource(R.string.settings_value_orange)
+    "Yellow" -> stringResource(R.string.settings_value_yellow)
+    "Green" -> stringResource(R.string.settings_value_green)
+    "Blue" -> stringResource(R.string.settings_value_blue)
+    "Indigo" -> stringResource(R.string.settings_value_indigo)
+    "Violet" -> stringResource(R.string.settings_value_violet)
+    "Cyan" -> stringResource(R.string.settings_value_cyan)
+    "Normal" -> stringResource(R.string.settings_value_normal)
+    "Bold" -> stringResource(R.string.settings_value_bold)
+    "Background" -> stringResource(R.string.settings_value_background)
+    "Low" -> stringResource(R.string.settings_value_low)
+    "Bottom" -> stringResource(R.string.settings_value_bottom)
+    "High" -> stringResource(R.string.settings_value_high)
+    "None" -> stringResource(R.string.settings_value_none)
+    "Forced" -> stringResource(R.string.settings_value_forced)
+    "Auto (Original)" -> stringResource(R.string.settings_value_auto_original)
+    "Tablet" -> stringResource(R.string.settings_ui_mode_tablet)
+    "Phone" -> stringResource(R.string.settings_ui_mode_phone)
+    "System DNS" -> stringResource(R.string.settings_dns_system)
+    "12-hour" -> stringResource(R.string.settings_clock_12h)
+    "24-hour" -> stringResource(R.string.settings_clock_24h)
+    else -> safeValue
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun SettingsRow(
+    icon: ImageVector? = null,
+    title: String,
+    subtitle: String = "",
+    value: String?,
+    isFocused: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val foreground = TextPrimary
+    val secondary = if (isFocused) Color.White.copy(alpha = 0.8f) else TextSecondary
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .graphicsLayer()
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick
+            )
+            .background(
+                Color.White.copy(alpha = if (isFocused) 0.1f else 0.05f),
+                RoundedCornerShape(8.dp)
+            )
+            .settingsFocusOutline(isFocused)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+            if (icon != null) Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = secondary,
+                modifier = Modifier.size(19.dp)
+            )
+            if (icon != null) Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = ArflixTypography.cardTitle.copy(fontSize = 16.sp),
+                    color = foreground,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (subtitle.isNotEmpty()) {
+                    Text(
+                        text = subtitle,
+                        style = ArflixTypography.caption.copy(fontSize = 13.sp, lineHeight = 17.sp),
+                        color = secondary,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+
+        val safeValue = value.orEmpty()
+        if (safeValue.isNotBlank()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = localizeSettingValue(safeValue),
+                    style = ArflixTypography.body.copy(fontSize = 14.sp),
+                    color = secondary,
+                    modifier = Modifier.widthIn(max = 220.dp),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = secondary, modifier = Modifier.size(20.dp))
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun SettingsToggleRow(
+    title: String,
+    subtitle: String,
+    isEnabled: Boolean,
+    isFocused: Boolean,
+    onToggle: (Boolean) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val foreground = TextPrimary
+    val secondary = if (isFocused) Color.White.copy(alpha = 0.8f) else TextSecondary
+    val toggleDescription = stringResource(if (isEnabled) R.string.on else R.string.off)
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .graphicsLayer()
+            .toggleable(
+                value = isEnabled,
+                role = Role.Switch,
+                interactionSource = interactionSource,
+                indication = null,
+                onValueChange = onToggle
+            )
+            .semantics { stateDescription = toggleDescription }
+            .background(
+                Color.White.copy(alpha = if (isFocused) 0.1f else 0.05f),
+                RoundedCornerShape(8.dp)
+            )
+            .settingsFocusOutline(isFocused)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = ArflixTypography.cardTitle.copy(fontSize = 16.sp),
+                color = foreground,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (subtitle.isNotEmpty()) {
+                Text(
+                    text = subtitle,
+                    style = ArflixTypography.caption.copy(fontSize = 13.sp, lineHeight = 17.sp),
+                    color = secondary,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
+        Spacer(Modifier.width(12.dp))
+        Box(
+            modifier = Modifier
+                .width(44.dp)
+                .height(24.dp)
+                .background(
+                    color = if (isEnabled) SuccessGreen else Color.White.copy(alpha = if (isFocused) 0.3f else 0.2f),
+                    shape = RoundedCornerShape(16.dp)
+                )
+                .padding(3.dp),
+            contentAlignment = if (isEnabled) Alignment.CenterEnd else Alignment.CenterStart
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(18.dp)
+                    .background(
+                        color = Color.White,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+            )
+        }
+    }
+}
+
+@Composable
+fun MobileSettingsCategory(
+    title: String,
+    content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Text(
+            text = title,
+            style = ArflixTypography.caption.copy(fontSize = 12.sp, letterSpacing = 1.sp),
+            color = TextSecondary,
+            modifier = Modifier.padding(start = 16.dp, bottom = 8.dp)
+        )
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(BackgroundElevated)
+        ) {
+            content()
+        }
+    }
+}
+
+@Composable
+fun MobileSettingsRow(
+    icon: ImageVector? = null,
+    @DrawableRes iconRes: Int? = null,
+    iconTint: Color = TextSecondary,
+    title: String,
+    subtitle: String = "",
+    value: String?,
+    enabled: Boolean = true,
+    isFocused: Boolean = false,
+    isToggle: Boolean = (value == "On" || value == "Off"),
+    isExternalLink: Boolean = false,
+    actionIcon: ImageVector? = null,
+    showDivider: Boolean = true,
+    toggleChecked: Boolean? = null,
+    onClick: () -> Unit
+) {
+    // Older callers still use English display tokens; localized toggles pass their Boolean state.
+    val checked = toggleChecked ?: if (isToggle) {
+        when (value) {
+            "On" -> true
+            "Off" -> false
+            else -> null
+        }
+    } else null
+    val toggleDescription = if (checked != null) {
+        stringResource(if (checked) R.string.on else R.string.off)
+    } else ""
+    val alpha = if (enabled) 1f else 0.4f
+    Column(modifier = Modifier.alpha(alpha)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(
+                    if (checked != null) Modifier
+                        .toggleable(checked, enabled = enabled, role = Role.Switch) { onClick() }
+                        .semantics { stateDescription = toggleDescription }
+                    else Modifier.clickable(enabled = enabled) { onClick() }
+                )
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.weight(1f)
+            ) {
+                when {
+                    iconRes != null -> Icon(
+                        painter = painterResource(id = iconRes),
+                        contentDescription = null,
+                        tint = iconTint,
+                        modifier = Modifier.size(24.dp)
+                    )
+                    icon != null -> Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        tint = iconTint,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+                if (iconRes != null || icon != null) {
+                    Spacer(modifier = Modifier.width(16.dp))
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = title,
+                        style = ArflixTypography.cardTitle.copy(fontSize = 16.sp),
+                        color = TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (subtitle.isNotEmpty()) {
+                        Text(
+                            text = subtitle,
+                            style = ArflixTypography.caption.copy(fontSize = 13.sp, lineHeight = 17.sp),
+                            color = TextSecondary,
+                            maxLines = 4,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+            val safeValue = value.orEmpty()
+            if (checked != null || safeValue.isNotEmpty() || isExternalLink || actionIcon != null) {
+                Spacer(modifier = Modifier.width(16.dp))
+                if (checked != null) {
+                    Box(
+                        modifier = Modifier
+                            .width(44.dp)
+                            .height(24.dp)
+                            .background(
+                                color = if (checked) SuccessGreen else Color.White.copy(alpha = 0.2f),
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                            .padding(3.dp),
+                        contentAlignment = if (checked) Alignment.CenterEnd else Alignment.CenterStart
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(18.dp)
+                                .background(
+                                    color = Color.White,
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+                        )
+                    }
+                } else if (isExternalLink || actionIcon != null) {
+                    Icon(
+                        imageVector = actionIcon ?: Icons.AutoMirrored.Filled.OpenInNew,
+                        contentDescription = null,
+                        tint = TextSecondary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                } else {
+                    Text(
+                        text = localizeSettingValue(safeValue),
+                        style = ArflixTypography.caption.copy(
+                            fontSize = 13.sp,
+                            fontWeight = androidx.compose.ui.text.font.FontWeight.Medium
+                        ),
+                        color = TextSecondary,
+                        modifier = Modifier.widthIn(max = 120.dp),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = TextSecondary, modifier = Modifier.size(18.dp))
+                }
+            }
+        }
+        if (showDivider) {
+            Box(modifier = Modifier.fillMaxWidth().height(1.dp).padding(horizontal = 16.dp).background(Color.White.copy(alpha = 0.05f)))
+        }
+    }
+}

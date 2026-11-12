@@ -1,0 +1,6001 @@
+package com.arflix.tv.ui.screens.home
+
+import android.app.ActivityManager
+import android.content.Context
+import com.arflix.tv.data.repository.effectiveSettingsDataStore as settingsDataStore
+import com.arflix.tv.util.traktDataStore
+import com.arflix.tv.util.IPTV_FAVORITES_ON_HOME
+import com.arflix.tv.util.WATCHLIST_ON_HOME
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import android.os.SystemClock
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import coil.ImageLoader
+import coil.imageLoader
+import coil.request.ImageRequest
+import coil.size.Precision
+import com.arflix.tv.data.model.Category
+import com.arflix.tv.data.model.CatalogConfig
+import com.arflix.tv.data.model.CatalogKind
+import com.arflix.tv.data.model.CatalogSourceType
+import com.arflix.tv.data.model.CollectionGroupKind
+import com.arflix.tv.data.model.collectionRailKeyOrGroup
+import com.arflix.tv.data.model.MediaItem
+import com.arflix.tv.data.model.MediaType
+import com.arflix.tv.data.model.SportsAddonCapabilities
+import com.arflix.tv.R
+import com.arflix.tv.data.repository.KidsContentFilter
+import com.arflix.tv.data.repository.MediaRepository
+import com.arflix.tv.data.repository.PersonalListsRepository
+import com.arflix.tv.ui.components.PersonalListPicker
+import com.arflix.tv.network.OkHttpProvider
+import com.arflix.tv.network.TmdbPriorityDispatcher
+import com.arflix.tv.network.withIptvProviderRequestGuard
+import com.arflix.tv.network.TmdbPriorityDispatcher.Priority
+import com.arflix.tv.data.repository.TraktRepository
+import com.arflix.tv.data.repository.TraktSyncService
+import com.arflix.tv.data.repository.ContinueWatchingItem
+import com.arflix.tv.data.repository.ContinueWatchingMerge
+import com.arflix.tv.data.repository.ContinueWatchingUpdate
+import com.arflix.tv.data.repository.ContinueWatchingUpdates
+import com.arflix.tv.data.repository.CatalogRepository
+import com.arflix.tv.data.repository.CloudSyncRepository
+import com.arflix.tv.data.repository.LauncherContinueWatchingRepository
+import com.arflix.tv.data.repository.ProfileManager
+import com.arflix.tv.data.repository.SportsRepository
+import com.arflix.tv.data.repository.StreamRepository
+import com.arflix.tv.data.repository.IptvPlaybackTarget
+import com.arflix.tv.data.repository.IptvPlaybackUrlResolver
+import com.arflix.tv.data.repository.IptvRepository
+import com.arflix.tv.data.repository.HomeServerRepository
+import com.arflix.tv.data.repository.CloudSyncStatus
+import com.arflix.tv.data.repository.CollectionTemplateManifest
+import com.arflix.tv.data.repository.WatchHistoryRepository
+import com.arflix.tv.data.repository.WatchlistRepository
+import com.arflix.tv.data.repository.sync.TrackingFeature
+import com.arflix.tv.util.AppLogger
+import com.arflix.tv.util.Constants
+import com.arflix.tv.util.DeviceType
+import com.arflix.tv.util.EpisodeAvailability
+import com.arflix.tv.util.TmdbImageSizing
+import com.arflix.tv.util.resolveAppLanguage
+import com.arflix.tv.util.detectDeviceType
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.cancelAndJoin
+import kotlin.math.roundToInt
+import java.util.Collections
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+
+@androidx.compose.runtime.Immutable
+data class HomeUiState(
+    val isLoading: Boolean = false,
+    val isInitialLoad: Boolean = true,
+    val categories: List<Category> = emptyList(),
+    val collectionRows: List<HomeCollectionRow> = emptyList(),
+    val error: String? = null,
+    // Current hero (may update during transitions)
+    val heroItem: MediaItem? = null,
+    val heroLogoUrl: String? = null,
+    val heroTrailerKey: String? = null,
+    val trailerAutoPlay: Boolean = true,
+    val trailerSoundEnabled: Boolean = false,
+    val trailerDelaySeconds: Int = 1,
+    val trailerInCards: Boolean = true,
+    val netflixHomeStyle: Boolean = true,
+    // Home hero metadata visibility toggles (issue #72)
+    val showBudget: Boolean = true,
+    val heroOverviewOverride: String? = null,
+    val cardLogoUrls: Map<String, String> = emptyMap(),
+    // Previous hero for crossfade (Phase 2.1)
+    val previousHeroItem: MediaItem? = null,
+    val previousHeroLogoUrl: String? = null,
+    // Transition state for animations
+    val isHeroTransitioning: Boolean = false,
+    val isAuthenticated: Boolean = false,
+    val clockFormat: String = "24h",
+    // Cloud sync status for the indicator on the home top bar
+    val syncStatus: com.arflix.tv.data.repository.CloudSyncStatus = com.arflix.tv.data.repository.CloudSyncStatus.NOT_SIGNED_IN,
+    // Toast
+    val toastMessage: String? = null,
+    val toastType: ToastType = ToastType.INFO,
+    // App Updates
+    val updateStatus: com.arflix.tv.updater.UpdateStatus = com.arflix.tv.updater.UpdateStatus.Idle,
+    val showAppUpdateDialog: Boolean = false,
+    val hasUpdateBadge: Boolean = false,
+    val categoryHasMoreMap: Map<String, Boolean> = emptyMap(),
+    val smoothScrolling: Boolean = false,
+    val isMobileSlowLoading: Boolean = false
+)
+
+@androidx.compose.runtime.Immutable
+data class HomeCollectionRow(
+    val id: String,
+    val title: String,
+    val items: List<CatalogConfig>
+)
+
+// Quiet update notifications show their notice once per process, i.e. once per cold start.
+private var quietUpdateNoticeShown = false
+
+internal fun compactHomeCategoriesForCache(
+    categories: List<Category>,
+    maxItemsPerCategory: Int
+): List<Category> = categories.mapNotNull { category ->
+    val items = category.items
+        .asSequence()
+        .filter { item -> !item.isPlaceholder && item.title.isNotBlank() && item.title != "Unknown" }
+        .take(maxItemsPerCategory)
+        .toList()
+    category.copy(items = items).takeIf { items.isNotEmpty() }
+}
+
+internal fun orderCategoriesBySavedCatalogs(
+    categories: List<Category>,
+    savedCatalogs: List<CatalogConfig>
+): List<Category> {
+    if (categories.size <= 1 || savedCatalogs.isEmpty()) return categories
+
+    val orderMap = HashMap<String, Int>(savedCatalogs.size)
+    var orderIdx = 0
+    for (cfg in savedCatalogs) {
+        val catId = savedCatalogRowId(cfg) ?: continue
+        if (!orderMap.containsKey(catId)) {
+            orderMap[catId] = orderIdx++
+        }
+    }
+
+    return categories.sortedWith { a, b ->
+        when {
+            a.id == "continue_watching" -> -1
+            b.id == "continue_watching" -> 1
+            else -> {
+                val idxA = orderMap[a.id] ?: Int.MAX_VALUE
+                val idxB = orderMap[b.id] ?: Int.MAX_VALUE
+                idxA.compareTo(idxB)
+            }
+        }
+    }
+}
+
+/** The Home row id a saved catalog renders as, or null for collection tiles (they live inside a rail). */
+private fun savedCatalogRowId(cfg: CatalogConfig): String? = when (cfg.kind) {
+    CatalogKind.COLLECTION -> null
+    CatalogKind.COLLECTION_RAIL -> cfg.collectionRailKeyOrGroup?.let { "collection_row_${it.lowercase(Locale.US)}" }
+    else -> cfg.id
+}
+
+/**
+ * Drops rows whose catalog is no longer in [savedCatalogs], i.e. the user removed it in
+ * Settings > Catalogs.
+ *
+ * Mobile Home keeps the rows it already shows and only replaces the ones it reloads, and
+ * [orderCategoriesBySavedCatalogs] merely pushes unknown ids to the end — so without this a
+ * removed catalog stayed on Home, and via the categories cache even across restarts.
+ *
+ * Rows that are on Home without being a catalog of their own are always kept: Continue
+ * Watching, Favorite TV (loaded on its own, independent of the saved list) and the sports
+ * rows (managed by [HomeViewModel.withSportsHomeRows]). A null [savedCatalogs] means the
+ * list could not be read, so nothing is dropped. An empty list is authoritative and
+ * removes all catalog rows.
+ */
+internal fun dropCategoriesMissingFromSavedCatalogs(
+    categories: List<Category>,
+    savedCatalogs: List<CatalogConfig>?
+): List<Category> {
+    if (categories.isEmpty() || savedCatalogs == null) return categories
+    val savedRowIds = savedCatalogs.mapNotNullTo(HashSet(savedCatalogs.size)) { savedCatalogRowId(it) }
+    return categories.filter { category ->
+        category.id in savedRowIds ||
+            category.id == "continue_watching" ||
+            category.id == HomeViewModel.FAVORITE_TV_CATEGORY_ID ||
+            category.id == SportsAddonCapabilities.SPORTS_CATEGORY_ROW_ID ||
+            category.id == SportsAddonCapabilities.POPULAR_LIVE_TV_ROW_ID
+    }
+}
+
+/**
+ * Applies the "Show IPTV favorites on home" preference to the Favorite TV row.
+ *
+ * Preserves the user's custom catalog ordering configured in Settings > Catalogs. The preference,
+ * not the catalog list, decides whether the row exists: a profile whose list lost the entry (a
+ * Home rebuilt from an imported template hides every built-in row, Favorite TV among them) still
+ * gets its favorites, at the top. Without favorites the row stays empty and is not shown.
+ */
+internal fun applyIptvFavoritesPlacement(
+    savedCatalogs: List<CatalogConfig>,
+    enabled: Boolean
+): List<CatalogConfig> {
+    val favIdx = savedCatalogs.indexOfFirst { it.id == HomeViewModel.FAVORITE_TV_CATEGORY_ID }
+    if (!enabled) {
+        return if (favIdx < 0) savedCatalogs
+            else savedCatalogs.filterNot { it.id == HomeViewModel.FAVORITE_TV_CATEGORY_ID }
+    }
+    if (favIdx >= 0) return savedCatalogs
+    val favoriteTv = MediaRepository.buildPreinstalledDefaults()
+        .firstOrNull { it.id == HomeViewModel.FAVORITE_TV_CATEGORY_ID } ?: return savedCatalogs
+    return listOf(favoriteTv) + savedCatalogs
+}
+
+/** Landscape Home card widths; the backdrop preload must size its requests like the row. */
+internal const val HOME_TV_LANDSCAPE_CARD_WIDTH_DP = 210
+internal const val HOME_MOBILE_LANDSCAPE_CARD_WIDTH_DP = 200
+internal const val HOME_TV_POSTER_CARD_WIDTH_DP = 105
+internal const val HOME_MOBILE_POSTER_CARD_WIDTH_DP = 120
+
+/**
+ * Pixel size of a landscape Home card, rounded the way Compose rounds `Dp.roundToPx()`, so the
+ * backdrop preload asks for the same TMDB size and memory-cache key as the card it warms.
+ */
+internal fun landscapeCardPixelSize(widthDp: Int, density: Float): Pair<Int, Int> {
+    val widthPx = (widthDp * density).roundToInt().coerceAtLeast(1)
+    val heightPx = (widthPx / (16f / 9f)).toInt().coerceAtLeast(1)
+    return widthPx to heightPx
+}
+
+/**
+ * Show ids with at least one watched episode, built once from the watched-episode keys
+ * ("show_tmdb:<id>:<season>:<episode>") instead of scanning the history for every show.
+ * Trakt-only keys ("show_trakt:…") carry no TMDB id and are skipped.
+ */
+internal fun startedShowIds(watchedEpisodeKeys: Set<String>): Set<Int> =
+    watchedEpisodeKeys.mapNotNullTo(HashSet()) { key ->
+        if (key.startsWith("show_tmdb:")) {
+            key.removePrefix("show_tmdb:").substringBefore(':', "").toIntOrNull()
+        } else null
+    }
+
+/**
+ * Sets [MediaItem.isWatched] on the Home cards: a film when it is in the watched list, a series
+ * when it has been started — the same reading Search and Discover use. Continue Watching keeps
+ * its own progress bars and is left alone. Rows (and the list) that do not change come back as
+ * the same instances, so a refresh that finds nothing new recomposes nothing.
+ */
+internal fun applyWatchedBadges(
+    categories: List<Category>,
+    watchedMovies: Set<Int>,
+    startedShows: Set<Int>
+): List<Category> {
+    var anyChange = false
+    val updated = categories.map { category ->
+        if (category.id == "continue_watching") return@map category
+        var categoryChanged = false
+        val items = category.items.map { item ->
+            val watched = when (item.mediaType) {
+                MediaType.MOVIE -> item.id in watchedMovies
+                MediaType.TV -> item.id in startedShows
+            }
+            if (item.isWatched == watched) {
+                item
+            } else {
+                categoryChanged = true
+                item.copy(isWatched = watched)
+            }
+        }
+        if (categoryChanged) {
+            anyChange = true
+            category.copy(items = items)
+        } else {
+            category
+        }
+    }
+    return if (anyChange) updated else categories
+}
+
+/**
+ * Marks the rows and the hero of [this] state; the same instance comes back when nothing changes.
+ */
+internal fun HomeUiState.withWatchedBadges(watchedMovies: Set<Int>, startedShows: Set<Int>): HomeUiState {
+    val updatedCategories = applyWatchedBadges(categories, watchedMovies, startedShows)
+    val updatedHero = heroWithWatchedBadge(heroItem, updatedCategories)
+    if (updatedCategories === categories && updatedHero === heroItem) return this
+    return copy(categories = updatedCategories, heroItem = updatedHero)
+}
+
+/**
+ * Whether a tick pass may be skipped: only when nothing asks for it ([force]), the rows are the
+ * very ones the last pass marked, and that pass is recent. Freshly published rows (a catalog
+ * load, a next page, a cloud reload) always carry unmarked cards, so they are never skipped.
+ */
+internal fun watchedBadgesPassIsRedundant(
+    rows: List<Category>,
+    lastMarkedRows: List<Category>?,
+    force: Boolean,
+    sinceLastPassMs: Long,
+    throttleMs: Long
+): Boolean = !force && rows === lastMarkedRows && sinceLastPassMs < throttleMs
+
+/**
+ * How long a tick pass waits before it runs. The first pass after launch or a profile switch keeps
+ * the startup pause, so it does not compete with the first frames. Once a pass has run, a pass
+ * Home asks for on resume (back from Details) — or one that replaces such a pending pass — only
+ * debounces briefly: the cache is loaded and the pass itself takes milliseconds.
+ */
+internal fun watchedBadgesPassDelayMs(
+    quickRequested: Boolean,
+    hadPass: Boolean,
+    isLowRamDevice: Boolean
+): Long = when {
+    quickRequested && hadPass -> 300L
+    isLowRamDevice -> 3_000L
+    else -> 1_800L
+}
+
+/**
+ * Carries the tick of [hero]'s card in [categories] over to the hero. The hero keeps its own
+ * instance: runtime, ratings, budget and the network logo are hydrated into the hero only, so
+ * swapping in the plain row card would drop them until focus moves.
+ */
+internal fun heroWithWatchedBadge(hero: MediaItem?, categories: List<Category>): MediaItem? {
+    if (hero == null) return null
+    val card = categories.asSequence()
+        .flatMap { it.items.asSequence() }
+        .firstOrNull { it.id == hero.id && it.mediaType == hero.mediaType }
+        ?: return hero
+    return if (card.isWatched == hero.isWatched) hero else hero.copy(isWatched = card.isWatched)
+}
+
+enum class ToastType {
+    SUCCESS, ERROR, INFO
+}
+
+@HiltViewModel
+@OptIn(ExperimentalCoroutinesApi::class)
+class HomeViewModel @Inject constructor(
+    private val mediaRepository: MediaRepository,
+    private val tmdbPriorityDispatcher: TmdbPriorityDispatcher,
+    private val catalogRepository: CatalogRepository,
+    private val streamRepository: StreamRepository,
+    private val sportsRepository: SportsRepository,
+    private val traktRepository: TraktRepository,
+    private val remoteSyncManager: com.arflix.tv.data.repository.sync.RemoteSyncManager,
+    private val traktSyncService: TraktSyncService,
+    private val iptvRepository: IptvRepository,
+    private val homeServerRepository: HomeServerRepository,
+    private val watchHistoryRepository: WatchHistoryRepository,
+    private val watchlistRepository: WatchlistRepository,
+    private val cloudSyncRepository: CloudSyncRepository,
+    private val launcherContinueWatchingRepository: LauncherContinueWatchingRepository,
+    private val continueWatchingUpdates: ContinueWatchingUpdates,
+    private val appForegroundSignals: com.arflix.tv.data.repository.AppForegroundSignals,
+    private val idleReturnCoordinator: com.arflix.tv.data.repository.IdleReturnCoordinator,
+    private val realtimeSyncManager: com.arflix.tv.data.repository.RealtimeSyncManager,
+    private val profileManager: ProfileManager,
+    private val appUpdateRepository: com.arflix.tv.updater.AppUpdateRepository,
+    private val apkDownloader: com.arflix.tv.updater.ApkDownloader,
+    private val updatePreferences: com.arflix.tv.updater.UpdatePreferences,
+    private val updateStatusManager: com.arflix.tv.updater.UpdateStatusManager,
+    private val youTubeExtractor: com.arflix.tv.data.api.InAppYouTubeExtractor,
+    private val personalListsRepository: PersonalListsRepository,
+    private val kidsContentFilter: KidsContentFilter,
+    @ApplicationContext private val context: Context
+) : ViewModel() {
+    /** "Add to list" from the context menu; the result shows as a Home toast. */
+    private val personalListPicker = PersonalListPicker(viewModelScope, personalListsRepository, context) { message, ok ->
+        _uiState.value = _uiState.value.copy(
+            toastMessage = message,
+            toastType = if (ok) ToastType.SUCCESS else ToastType.ERROR
+        )
+    }
+    val listPicker: StateFlow<PersonalListPicker.State?> = personalListPicker.state
+
+    suspend fun hasPersonalLists(): Boolean = personalListPicker.isAvailable()
+    fun openListPicker(item: MediaItem) = personalListPicker.open(item)
+    fun toggleListMembership(choice: PersonalListsRepository.Choice) = personalListPicker.toggle(choice)
+    fun closeListPicker() = personalListPicker.close()
+
+    val kidsFilterState: StateFlow<KidsContentFilter.State> = kidsContentFilter.state
+
+    /**
+     * Home as a kids profile may see it: every row age-filtered, no live TV. Any other
+     * profile gets [state] back unchanged.
+     */
+    fun applyKidsFilter(state: HomeUiState, kids: KidsContentFilter.State): HomeUiState {
+        if (!kids.isActive) return state
+        val categories = kidsContentFilter.filterCategories(
+            state.categories.filterNot { it.id == FAVORITE_TV_CATEGORY_ID },
+            kids
+        )
+        val hero = state.heroItem?.takeIf(kids::allows)
+            ?: categories.asSequence().flatMap { it.items }.firstOrNull { !it.isPlaceholder }
+        val sameHero = hero == state.heroItem
+        return state.copy(
+            categories = categories,
+            heroItem = hero,
+            heroLogoUrl = state.heroLogoUrl.takeIf { sameHero },
+            heroTrailerKey = state.heroTrailerKey.takeIf { sameHero },
+            heroOverviewOverride = state.heroOverviewOverride.takeIf { sameHero },
+            previousHeroItem = state.previousHeroItem?.takeIf(kids::allows)
+        )
+    }
+
+    fun filterForKids(items: List<MediaItem>, kids: KidsContentFilter.State): List<MediaItem> =
+        kidsContentFilter.filter(items, kids)
+
+    private val _homeWatchlistItems = MutableStateFlow<List<MediaItem>>(emptyList())
+    val homeWatchlistItems: StateFlow<List<MediaItem>> = _homeWatchlistItems.asStateFlow()
+    private val homeWatchlistRefreshes = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    @Volatile private var homeWatchlistProfileId: String? = null
+
+    fun refreshHomeWatchlist() {
+        homeWatchlistRefreshes.tryEmit(Unit)
+    }
+
+    private fun observeHomeWatchlist() {
+        viewModelScope.launch(Dispatchers.IO) {
+            profileManager.activeProfileId.combine(context.settingsDataStore.data) { profileId, prefs ->
+                profileId to (prefs[booleanPreferencesKey("profile_${profileId}_$WATCHLIST_ON_HOME")] ?: false)
+            }.distinctUntilChanged().onEach { (profileId, enabled) ->
+                homeWatchlistProfileId = profileId.takeIf { enabled }
+                _homeWatchlistItems.value = emptyList()
+            }.collectLatest { (profileId, enabled) ->
+                if (!enabled) return@collectLatest
+                coroutineScope {
+                    launch {
+                        watchlistRepository.watchlistItems.collect {
+                            if (homeWatchlistProfileId == profileId && profileManager.getProfileIdSync() == profileId) {
+                                _homeWatchlistItems.value = homeWatchlistDisplayItems(watchlistRepository.getCachedItems())
+                            }
+                        }
+                    }
+                    var lastRemoteRefresh = 0L
+                    homeWatchlistRefreshes.onStart { emit(Unit) }.collect {
+                        try {
+                            watchlistRepository.getLocalWatchlistItems()
+                            if (profileManager.getProfileIdSync() != profileId) return@collect
+                            val now = SystemClock.elapsedRealtime()
+                            if (lastRemoteRefresh != 0L && now - lastRemoteRefresh < 60_000L) return@collect
+                            lastRemoteRefresh = now
+                            withTimeoutOrNull(12_000L) {
+                                val remote = remoteSyncManager.getWatchlist()
+                                if (homeWatchlistProfileId == profileId && profileManager.getProfileIdSync() == profileId &&
+                                    remote?.connected == true && !remote.items.isNullOrEmpty()
+                                ) {
+                                    watchlistRepository.syncFromTraktOrder(remote.items, profileId)
+                                }
+                            }
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Exception) {
+                            AppLogger.e("HomeVM", "Home watchlist refresh failed", error)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private val imageLoader: ImageLoader by lazy(LazyThreadSafetyMode.NONE) {
+        context.imageLoader
+    }
+
+    private data class HeroDetailsSnapshot(
+        val duration: String,
+        val releaseDate: String?,
+        val imdbRating: String,
+        val tmdbRating: String,
+        val budget: Long?,
+        val overview: String,
+        val primaryNetworkLogo: String? = null,
+        val fullyLoaded: Boolean = false
+    )
+
+    private data class CategoryPaginationState(
+        var loadedCount: Int = 0,
+        var hasMore: Boolean = true,
+        var isLoading: Boolean = false,
+        var nextOffset: Int = loadedCount
+    )
+
+    // IPTV favorite channels — maps MediaItem.id (Int hash) to channel data. Written from IO
+    // (row builds, [resolveIptvChannels]) and read from composition.
+    private val iptvChannelMap = java.util.concurrent.ConcurrentHashMap<Int, com.arflix.tv.data.model.IptvChannel>()
+    // Bumped when [resolveIptvChannels] adds channels, so the hero re-reads its stream URL.
+    private val _iptvChannelsVersion = MutableStateFlow(0)
+    val iptvChannelsVersion: StateFlow<Int> = _iptvChannelsVersion.asStateFlow()
+    private val _sportsHomeRows = MutableStateFlow<List<Category>>(emptyList())
+    val sportsHomeRows: StateFlow<List<Category>> = combine(
+        _sportsHomeRows,
+        catalogRepository.observeCatalogs().map { catalogs ->
+            catalogs.map { it.id }.toSet()
+        }.distinctUntilChanged()
+    ) { rows, visibleIds ->
+        val filteredByCatalog = rows.filter { it.id in visibleIds }
+        if (!isTvDevice) {
+            filteredByCatalog.filter { row ->
+                row.items.any { item ->
+                    !item.isPlaceholder && !SportsAddonCapabilities.isSportsLockedStatus(item.status)
+                }
+            }
+        } else {
+            filteredByCatalog
+        }
+    }.let { flow ->
+        val state = MutableStateFlow<List<Category>>(emptyList())
+        viewModelScope.launch { flow.collect { state.value = it } }
+        state.asStateFlow()
+    }
+    private var selectedSportsCategoryId: String? = null
+
+    companion object {
+        /** Profiles already told this app run that Trakt needs reconnecting. */
+        private val traktReconnectNoticeShown: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+        private val mdbListReconnectNoticeShown: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+        const val FAVORITE_TV_CATEGORY_ID = "favorite_tv"
+        /** Unfiltered titles a kids top-up may load for one grid before it gives up. */
+        private const val MAX_KIDS_TOP_UP_ITEMS = 600
+        /** Prefix used in MediaItem.status to identify IPTV items. */
+        const val IPTV_STATUS_PREFIX = "iptv:"
+        private const val TOP_10_ITEM_LIMIT = 10
+        private val BUILTIN_TMDB_CATEGORY_IDS = setOf(
+            "trending_movies",
+            "trending_tv",
+            "trending_anime"
+        )
+        private val HARD_CAPPED_TOP_10_CATALOG_IDS = setOf(
+            "top10_movies_today",
+            "top10_shows_today"
+        )
+    }
+
+    /** Check if a MediaItem represents an IPTV channel. */
+    fun isIptvItem(item: MediaItem): Boolean = item.status?.startsWith(IPTV_STATUS_PREFIX) == true
+
+    fun isCollectionItem(item: MediaItem): Boolean = item.status?.startsWith("collection:") == true
+
+    fun isSportsHomeItem(item: MediaItem): Boolean =
+        SportsAddonCapabilities.isSportsHomeStatus(item.status)
+
+    fun withSportsHomeRows(
+        categories: List<Category>,
+        sportsRows: List<Category>
+    ): List<Category> {
+        if (!isTvDevice) {
+            val activeSportsRows = sportsRows.filter { row ->
+                row.items.any { item ->
+                    !item.isPlaceholder && !SportsAddonCapabilities.isSportsLockedStatus(item.status)
+                }
+            }
+            val activeSportsById = activeSportsRows.associateBy { it.id }
+            // On mobile: If no sports addon is installed or a sports row is locked/empty,
+            // strictly strip it from the mobile feed (both from categories and sportsRows).
+            val filteredCategories = categories.mapNotNull { category ->
+                if (category.id == SportsAddonCapabilities.POPULAR_LIVE_TV_ROW_ID ||
+                    category.id == SportsAddonCapabilities.SPORTS_CATEGORY_ROW_ID) {
+                    activeSportsById[category.id]
+                } else {
+                    activeSportsById[category.id] ?: category
+                }
+            }
+            val existingIds = filteredCategories.map { it.id }.toSet()
+            val extraActiveSports = activeSportsRows.filter { it.id !in existingIds }
+            return if (extraActiveSports.isNotEmpty()) {
+                sportsRepository.mergeSportsRows(filteredCategories, extraActiveSports)
+            } else {
+                filteredCategories
+            }
+        } else {
+            return sportsRepository.mergeSportsRows(categories, sportsRows)
+        }
+    }
+
+    fun openSportsHomeItem(
+        item: MediaItem,
+        onNavigateToSettings: () -> Unit,
+        onNavigateToPlayer: (MediaType, Int, String, String?, String?) -> Unit
+    ) {
+        val status = item.status.orEmpty()
+        viewModelScope.launch {
+            val addons = streamRepository.installedAddons.first()
+            val hasSportsAddon = addons.any { addon ->
+                addon.isInstalled &&
+                    addon.isEnabled &&
+                    SportsAddonCapabilities.isSportsLiveTvAddon(addon)
+            }
+
+            when {
+                SportsAddonCapabilities.isSportsEventStatus(status) -> {
+                    if (!hasSportsAddon) {
+                        showSportsToast(context.getString(R.string.home_sports_addon_required), ToastType.INFO)
+                        onNavigateToSettings()
+                        return@launch
+                    }
+                    if (!item.badge.equals("LIVE", ignoreCase = true)) {
+                        showSportsToast(context.getString(R.string.home_sports_event_not_live), ToastType.INFO)
+                        return@launch
+                    }
+                    showSportsToast(context.getString(R.string.home_sports_opening), ToastType.INFO)
+                    val playback = sportsRepository.resolvePlayback(status, item.title)
+                    if (playback == null) {
+                        showSportsToast(context.getString(R.string.home_sports_playback_failed), ToastType.ERROR)
+                    } else {
+                        onNavigateToPlayer(
+                            MediaType.TV,
+                            playback.mediaId,
+                            playback.streamUrl,
+                            playback.addonId,
+                            playback.sourceName
+                        )
+                    }
+                }
+
+                SportsAddonCapabilities.isSportsCategoryStatus(status) -> {
+                    if (!hasSportsAddon) {
+                        showSportsToast(context.getString(R.string.home_sports_addon_required), ToastType.INFO)
+                        onNavigateToSettings()
+                        return@launch
+                    }
+                    selectedSportsCategoryId = sportsRepository.selectedSportIdFromStatus(status)
+                    _sportsHomeRows.value = sportsRepository.buildHomeRows(addons, selectedSportsCategoryId)
+                }
+
+                else -> {
+                    showSportsToast(context.getString(R.string.home_sports_addon_required), ToastType.INFO)
+                    onNavigateToSettings()
+                }
+            }
+        }
+    }
+
+    private fun showSportsToast(message: String, type: ToastType) {
+        _uiState.value = _uiState.value.copy(
+            toastMessage = message,
+            toastType = type
+        )
+    }
+
+    /** Returns the service / franchise hero-video URL for a focused collection tile, or null. */
+    fun getCollectionHeroVideoUrl(item: MediaItem): String? {
+        if (!isCollectionItem(item)) return null
+        return collectionCatalogByMediaId[item.id]?.collectionHeroVideoUrl
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    fun getCollectionHeroImageUrl(item: MediaItem): String? {
+        if (!isCollectionItem(item)) return null
+        return collectionCatalogByMediaId[item.id]?.collectionHeroImageUrl
+            ?.takeIf { it.isNotBlank() }
+            ?: collectionCatalogByMediaId[item.id]?.collectionCoverImageUrl?.takeIf { it.isNotBlank() }
+    }
+
+    private fun isActionableMediaItem(item: MediaItem): Boolean {
+        // Non-actionable items are expected during filtering: invalid IDs cannot be opened,
+        // placeholders are synthetic UI entries, and collection tiles use their own handling.
+        return item.hasOpenableId && !item.isPlaceholder && !isCollectionItem(item) && !isSportsHomeItem(item)
+    }
+
+    private fun continueWatchingKey(mediaType: MediaType, id: Int): String {
+        return "${mediaType.name}:$id"
+    }
+
+    private suspend fun applyContinueWatchingDismissals(
+        items: List<ContinueWatchingItem>
+    ): List<ContinueWatchingItem> {
+        val cloudFiltered = try {
+            traktRepository.filterDismissedContinueWatchingItems(items)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            items
+        }
+        return cloudFiltered.filter { item ->
+            val key = continueWatchingKey(item.mediaType, item.id)
+            val dismissedAt = dismissedContinueWatchingAt[key] ?: return@filter true
+            if (item.updatedAtMs > dismissedAt) {
+                dismissedContinueWatchingAt.remove(key)
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    private fun isHardCappedTop10Catalog(categoryId: String): Boolean {
+        return categoryId in HARD_CAPPED_TOP_10_CATALOG_IDS
+    }
+
+    private fun Category.withTop10CapIfNeeded(): Category {
+        return if (isHardCappedTop10Catalog(id) && items.size > TOP_10_ITEM_LIMIT) {
+            copy(items = items.take(TOP_10_ITEM_LIMIT))
+        } else {
+            this
+        }
+    }
+
+    private suspend fun isCatalogPosterMode(catalogId: String): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val prefs = context.settingsDataStore.data.first()
+                val profileId = profileManager.getProfileIdSync().ifBlank { "default" }
+
+                // In Netflix-style TV Home, regular catalog rows are always posters.
+                val netflixHomeStyleKey = profileManager.profileBooleanKeyFor(
+                    profileId,
+                    NETFLIX_HOME_STYLE_KEY
+                )
+                val netflixHomeStyle = prefs[netflixHomeStyleKey] ?: true
+                if (isTvDevice && netflixHomeStyle) {
+                    return@withContext true
+                }
+
+                // 1. Check specific row layout mode
+                val rowKey = "home:$catalogId"
+                val normalizedRowKey = com.arflix.tv.ui.components.normalizeCatalogueRowLayoutKey(rowKey)
+                val rowPrefKey = stringPreferencesKey(
+                    "profile_${profileId}_catalogue_row_layout_${normalizedRowKey}"
+                )
+                val rowValue = prefs[rowPrefKey]
+                if (rowValue != null) {
+                    return@withContext rowValue.trim().equals("Poster", ignoreCase = true)
+                }
+
+                // 2. Check profile global default card layout mode
+                val profilePrefKey = stringPreferencesKey("profile_${profileId}_card_layout_mode")
+                val profileValue = prefs[profilePrefKey]
+                if (profileValue != null) {
+                    return@withContext profileValue.trim().equals("Poster", ignoreCase = true)
+                }
+
+                // 3. Check legacy global default card layout mode
+                val legacyPrefKey = stringPreferencesKey("card_layout_mode")
+                val legacyValue = prefs[legacyPrefKey]
+                if (legacyValue != null) {
+                    return@withContext legacyValue.trim().equals("Poster", ignoreCase = true)
+                }
+
+                // Default fallback
+                false
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                false
+            }
+        }
+    }
+
+    private suspend fun catalogInitialLimit(catalog: CatalogConfig): Int {
+        if (isHardCappedTop10Catalog(catalog.id)) return TOP_10_ITEM_LIMIT
+
+        if (isCatalogPosterMode(catalog.id)) {
+            // Dynamic limit calculation for portrait (poster) catalogs
+            val screenWidthDp = context.resources.configuration.screenWidthDp
+            val posterWidth = if (isTvDevice) 119 else 124
+            val posterSpacing = if (isTvDevice) 14 else 10
+            val padding = 16
+
+            // Calculate how many items fit on the screen
+            val fitCount = (screenWidthDp - padding) / (posterWidth + posterSpacing)
+
+            // We want to load at least 12 items, or fitCount + 2 (comfort items), whichever is larger
+            return maxOf(12, fitCount + 2)
+        }
+
+        return initialCategoryItemCap
+    }
+
+    private suspend fun getCategoryPageSize(categoryId: String): Int {
+        if (isCatalogPosterMode(categoryId)) {
+            // Dynamic limit calculation for portrait (poster) catalogs
+            val screenWidthDp = context.resources.configuration.screenWidthDp
+            val posterWidth = if (isTvDevice) 119 else 124
+            val posterSpacing = if (isTvDevice) 14 else 10
+            val padding = 16
+
+            // Calculate how many items fit on the screen
+            val fitCount = (screenWidthDp - padding) / (posterWidth + posterSpacing)
+
+            // We want to load at least 12 items, or fitCount + 2 (comfort items), whichever is larger
+            return maxOf(12, fitCount + 2)
+        }
+        return categoryPageSize
+    }
+
+    private fun continueWatchingShowKey(item: ContinueWatchingItem): String {
+        return continueWatchingKey(item.mediaType, item.id)
+    }
+
+    private fun parseContinueWatchingUpdatedAt(primary: String?, fallback: String? = null): Long {
+        fun parse(value: String?): Long {
+            if (value.isNullOrBlank()) return 0L
+            return try {
+                java.time.Instant.parse(value).toEpochMilli()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                0L
+            }
+        }
+        return maxOf(parse(primary), parse(fallback))
+    }
+
+    private fun mergeContinueWatchingVisuals(
+        preferred: ContinueWatchingItem,
+        fallback: ContinueWatchingItem
+    ): ContinueWatchingItem = ContinueWatchingMerge.mergeVisuals(preferred, fallback)
+
+    private fun needsContinueWatchingArtworkRepair(item: ContinueWatchingItem): Boolean {
+        return item.posterPath.isNullOrBlank() ||
+            item.backdropPath.isNullOrBlank() ||
+            (item.mediaType == MediaType.TV && item.season != null && item.episode != null && item.episodeStillPath.isNullOrBlank()) ||
+            item.overview.isBlank() ||
+            item.durationSeconds <= 0L
+    }
+
+    private suspend fun repairContinueWatchingMetadataIfNeeded(
+        items: List<ContinueWatchingItem>
+    ): List<ContinueWatchingItem> {
+        if (items.none(::needsContinueWatchingArtworkRepair)) return items
+        return runCatching {
+            traktRepository.enrichContinueWatchingItems(items)
+                .zip(items) { enriched, original ->
+                    mergeContinueWatchingVisuals(enriched, original)
+                }
+                .ifEmpty { items }
+        }.onFailure { error ->
+            AppLogger.recordException(
+                throwable = error,
+                context = mapOf(
+                    "error_area" to "ContinueWatching",
+                    "cw_phase" to "metadata_repair"
+                )
+            )
+        }.getOrDefault(items)
+    }
+
+    private fun mergeTraktAndRecentLocalContinueWatching(
+        traktItems: List<ContinueWatchingItem>,
+        localItems: List<ContinueWatchingItem>,
+        historyItems: List<ContinueWatchingItem>
+    ): List<ContinueWatchingItem> = ContinueWatchingMerge.merge(traktItems, localItems, historyItems)
+
+    private fun overviewLooksTruncated(overview: String): Boolean {
+        val value = overview.trim()
+        return value.isBlank() || value.endsWith("...") || value.length < 140
+    }
+
+    private suspend fun resolveBestOverview(item: MediaItem, candidateOverview: String): String {
+        val base = candidateOverview.trim()
+        if (!overviewLooksTruncated(base) || item.title.isBlank()) {
+            return base
+        }
+
+        val searchMatches = try {
+            mediaRepository.search(item.title)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            emptyList()
+        }
+        // Only the same title: a name search also returns other titles with that name
+        // (a 1955 film, a 1981 miniseries), whose longer overview is not this title's.
+        val bestMatch = searchMatches
+            .filter { match -> match.id == item.id && match.mediaType == item.mediaType }
+            .filter { match -> match.overview.isNotBlank() }
+            .maxByOrNull { match ->
+                val titleBonus = if (match.title.equals(item.title, ignoreCase = true)) 1_000 else 0
+                val typeBonus = if (match.mediaType == item.mediaType) 120 else 0
+                val qualityBonus = if (!overviewLooksTruncated(match.overview)) 80 else 0
+                titleBonus + typeBonus + qualityBonus + match.overview.length
+            }
+
+        val improved = bestMatch?.overview?.trim().orEmpty()
+        return if (
+            improved.isNotBlank() &&
+            (improved.length > base.length || (!improved.endsWith("...") && base.endsWith("...")))
+        ) {
+            improved
+        } else {
+            base
+        }
+    }
+
+    private suspend fun resolvePrimaryNetworkLogo(mediaType: MediaType, mediaId: Int): String? {
+        return runCatching {
+            mediaRepository.getStreamingServices(
+                mediaType = mediaType,
+                mediaId = mediaId,
+                preferredRegion = Locale.getDefault().country
+            )
+        }.getOrNull()
+            ?.services
+            ?.firstOrNull()
+            ?.logoUrl
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun heroDetailsKey(item: MediaItem): String = "${item.mediaType}_${item.id}"
+
+    private fun MediaItem.withHeroDetails(snapshot: HeroDetailsSnapshot): MediaItem {
+        return copy(
+            duration = snapshot.duration.ifEmpty { duration },
+            releaseDate = snapshot.releaseDate ?: releaseDate,
+            imdbRating = snapshot.imdbRating.ifEmpty { imdbRating },
+            tmdbRating = snapshot.tmdbRating.ifEmpty { tmdbRating },
+            budget = snapshot.budget ?: budget,
+            overview = snapshot.overview.ifBlank { overview },
+            primaryNetworkLogo = snapshot.primaryNetworkLogo ?: primaryNetworkLogo
+        )
+    }
+
+    private fun snapshotFromCachedFullItem(item: MediaItem): HeroDetailsSnapshot? {
+        val cached = mediaRepository.getCachedFullItem(item.mediaType, item.id) ?: return null
+        return HeroDetailsSnapshot(
+            duration = cached.duration,
+            releaseDate = cached.releaseDate,
+            imdbRating = cached.imdbRating,
+            tmdbRating = cached.tmdbRating,
+            budget = cached.budget,
+            overview = cached.overview,
+            primaryNetworkLogo = cached.primaryNetworkLogo,
+            fullyLoaded = false
+        )
+    }
+
+    fun cacheItem(item: MediaItem) {
+        mediaRepository.cacheItem(item)
+    }
+
+    fun cacheLogoUrl(mediaType: MediaType, mediaId: Int, logoUrl: String) {
+        mediaRepository.cacheLogoUrl(mediaType, mediaId, logoUrl)
+    }
+
+    /** Reuse Home's metadata cache without changing Home's focused hero underneath this screen. */
+    suspend fun loadViewAllPreview(item: MediaItem): MediaItem = withContext(networkDispatcher) {
+        if (item.id <= 0 || item.isHomeServer || item.isAddonNative ||
+            !isActionableMediaItem(item) || isIptvItem(item)
+        ) return@withContext item
+        val cached = getCachedHeroDetailsSnapshot(item)
+        val snapshot = if (cached?.fullyLoaded == true) cached else loadHeroDetailsSnapshot(item) ?: cached
+        if (snapshot != null) {
+            heroDetailsCache[heroDetailsKey(item)] = snapshot
+            item.withHeroDetails(snapshot)
+        } else item
+    }
+
+    private fun getCachedHeroDetailsSnapshot(item: MediaItem): HeroDetailsSnapshot? {
+        val key = heroDetailsKey(item)
+        return heroDetailsCache[key]
+            ?: snapshotFromCachedFullItem(item)?.also { heroDetailsCache[key] = it }
+    }
+
+    private fun applyHeroDetailsSnapshotIfCurrent(item: MediaItem, snapshot: HeroDetailsSnapshot): Boolean {
+        val updatedState = _uiState.updateAndGet { current ->
+            if (!current.heroItem.isSameHomeHero(item)) return@updateAndGet current
+            val updatedHero = current.heroItem!!.withHeroDetails(snapshot)
+            current.copy(
+                heroItem = updatedHero,
+                heroOverviewOverride = snapshot.overview.ifBlank { updatedHero.overview },
+                isHeroTransitioning = false
+            )
+        }
+        if (!updatedState.heroItem.isSameHomeHero(item)) return false
+        updatedState.heroItem?.let { mediaRepository.cacheItem(it) }
+        return true
+    }
+
+    private suspend fun loadHeroDetailsSnapshot(item: MediaItem): HeroDetailsSnapshot? {
+        if (!isActionableMediaItem(item) || isIptvItem(item) || isCollectionItem(item)) {
+            return null
+        }
+
+        return coroutineScope {
+            val detailsDeferred = async {
+                runCatching {
+                    if (item.mediaType == MediaType.MOVIE) {
+                        mediaRepository.getMovieDetails(item.id)
+                    } else {
+                        mediaRepository.getTvDetails(item.id)
+                    }
+                }.getOrNull()
+            }
+            val providerLogoDeferred = async {
+                resolvePrimaryNetworkLogo(item.mediaType, item.id)
+            }
+
+            val details = detailsDeferred.await()
+            val primaryNetworkLogo = providerLogoDeferred.await()
+            if (details == null && primaryNetworkLogo == null) {
+                return@coroutineScope null
+            }
+
+            val resolvedOverview = resolveBestOverview(
+                item = item,
+                candidateOverview = details?.overview?.ifBlank { item.overview } ?: item.overview
+            )
+            HeroDetailsSnapshot(
+                duration = details?.duration.orEmpty(),
+                releaseDate = details?.releaseDate,
+                imdbRating = details?.imdbRating.orEmpty(),
+                tmdbRating = details?.tmdbRating.orEmpty(),
+                budget = details?.budget,
+                overview = resolvedOverview,
+                primaryNetworkLogo = primaryNetworkLogo,
+                fullyLoaded = true
+            )
+        }
+    }
+
+    private suspend fun sanitizeContinueWatchingItems(
+        items: List<ContinueWatchingItem>, cacheOnly: Boolean = false
+    ): List<ContinueWatchingItem> = coroutineScope {
+        val installedAddons = streamRepository.installedAddons.first()
+        val nonLiveItems = items.filterNot { item ->
+            SportsAddonCapabilities.isLiveStreamOrSportsItem(
+                mediaType = item.mediaType,
+                id = item.id,
+                streamAddonId = item.streamAddonId,
+                title = item.title,
+                // Also drops live channels saved before they were played as live.
+                isLiveStream = mediaRepository.isAddonNativeLiveChannel(item.id),
+                addons = installedAddons,
+                isAddonNative = !item.addonNativeId.isNullOrBlank()
+            )
+        }
+        if (nonLiveItems.isEmpty()) return@coroutineScope emptyList()
+        val seasons = withContext(networkDispatcher) {
+            loadContinueWatchingSeasons(nonLiveItems, cacheOnly,
+                mediaRepository::peekCachedSeasonEpisodes, mediaRepository::getSeasonEpisodes)
+        }
+        nonLiveItems.mapNotNull { item ->
+            if (!item.addonNativeId.isNullOrBlank()) mediaRepository.cacheItem(item.toMediaItem())
+            if (item.mediaType != MediaType.TV) {
+
+                return@mapNotNull item
+            }
+
+            val season = item.season
+            val episode = item.episode
+            if (season == null || episode == null) {
+                return@mapNotNull item
+            }
+
+            // Locally persisted up-next pointers carry the episode air date. This lets a
+            // caught-up show stay hidden even when TMDB is temporarily unavailable, then
+            // become eligible again as soon as the stored date arrives.
+            if (
+                item.isUpNext && item.releaseDate.isNotBlank() &&
+                !EpisodeAvailability.hasAired(item.releaseDate)
+            ) {
+                return@mapNotNull null
+            }
+
+            val cacheKey = item.id to season
+            if (!item.addonNativeId.isNullOrBlank()) return@mapNotNull item
+            validatedContinueWatchingEpisode(item, seasons[cacheKey])
+        }
+    }
+
+    /** Extract the IPTV channel ID from a MediaItem's status field. */
+    fun getIptvChannelId(item: MediaItem): String? =
+        item.status?.removePrefix(IPTV_STATUS_PREFIX)?.takeIf { it.isNotBlank() }
+
+    /** Get the stream URL for an IPTV MediaItem. */
+    fun getIptvStreamUrl(itemId: Int): String? = iptvChannelMap[itemId]?.streamUrl
+
+    // The same resolver and client limits as the Live TV screen, so a channel previews on Home
+    // exactly when it plays there.
+    private val iptvPlaybackUrlResolver by lazy {
+        IptvPlaybackUrlResolver(
+            OkHttpProvider.playbackClient.newBuilder()
+                .withIptvProviderRequestGuard()
+                .addInterceptor(com.arflix.tv.network.IptvPlaybackConnections())
+                .connectTimeout(3, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(3, java.util.concurrent.TimeUnit.SECONDS)
+                .callTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+        )
+    }
+
+    /**
+     * What the hero preview should play for a channel card. An address without a file type
+     * (`.../play/channel`) says nothing about its format; the resolver asks the server once and
+     * caches the answer, while addresses that already show their type are returned as they are.
+     */
+    internal suspend fun resolveIptvPreviewTarget(
+        itemId: Int,
+        session: com.arflix.tv.network.IptvStreamSession?,
+    ): IptvPlaybackTarget? {
+        val channel = iptvChannelMap[itemId] ?: return null
+        return runCatching { iptvPlaybackUrlResolver.resolve(channel.streamUrl, channel.requestHeaders, session = session) }
+            .onFailure { if (it is CancellationException) throw it }
+            .getOrNull()
+    }
+
+    /** Null until the card's channel is known; the hero opens nothing until it has an answer. */
+    internal suspend fun iptvPreviewGate(itemId: Int): HomeIptvPreviewGate? {
+        val channel = iptvChannelMap[itemId] ?: return null
+        return readHomeIptvPreviewGate(itemId) { iptvRepository.resolveChannelStreamPolicy(channel) }
+    }
+
+    /** A preview must resolve to a known owner, even when that owner explicitly allows unlimited playback. */
+    internal suspend fun iptvPreviewPolicy(itemId: Int): com.arflix.tv.data.repository.ResolvedIptvChannelPolicy? {
+        val channel = iptvChannelMap[itemId] ?: return null
+        return iptvRepository.resolveChannelStreamPolicy(channel)
+    }
+
+    /** The panel's live slot count for preview admission, never stored on disk. */
+    internal suspend fun iptvAccountUsage(account: com.arflix.tv.network.IptvProviderAccount) =
+        iptvRepository.fetchAccountUsage(account)
+
+    /** The profile's "Default subtitle" setting for channel previews (off when it cannot be read). */
+    internal suspend fun previewSubtitleDefault(): com.arflix.tv.ui.screens.tv.live.LiveSubtitleDefault = runCatching {
+        val prefs = context.settingsDataStore.data.first()
+        com.arflix.tv.ui.screens.tv.live.liveSubtitleDefault(
+            prefs[profileManager.profileStringKey("default_subtitle")]
+        )
+    }.onFailure { if (it is CancellationException) throw it }
+        .getOrDefault(com.arflix.tv.ui.screens.tv.live.LiveSubtitleDefault.Off)
+
+    /**
+     * Looks up the channels behind IPTV cards this view model didn't build itself. Rows
+     * preloaded at startup carry the cards but not their channels, and the full home load
+     * only rebuilds the Favorite TV row after every other row (tens of seconds on a cold
+     * start), so until then a focused channel card had no stream URL and no preview.
+     */
+    fun resolveIptvChannels(items: List<MediaItem>) {
+        val pending = items
+            .filter { isIptvItem(it) && !iptvChannelMap.containsKey(it.id) }
+            .mapNotNull { item -> getIptvChannelId(item)?.let { it to item.id } }
+            .toMap()
+        if (pending.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val found = runCatching {
+                val snapshot = iptvRepository.getMemoryCachedSnapshot()
+                    ?: iptvRepository.getCachedSnapshotOrNull()
+                val byId = snapshot?.channels.orEmpty()
+                    .filter { it.id in pending }
+                    .associateByTo(HashMap()) { it.id }
+                val missing = pending.keys - byId.keys
+                if (missing.isNotEmpty()) {
+                    iptvRepository.pagedChannelsByIds(missing).forEach { byId[it.id] = it }
+                }
+                byId.values
+            }.getOrDefault(emptyList())
+            var added = false
+            found.forEach { channel ->
+                val itemId = pending[channel.id] ?: return@forEach
+                if (iptvChannelMap.putIfAbsent(itemId, channel) == null) added = true
+            }
+            if (added) _iptvChannelsVersion.update { it + 1 }
+        }
+    }
+
+    private fun iptvChannelToMediaItem(
+        channel: com.arflix.tv.data.model.IptvChannel,
+        epg: com.arflix.tv.data.model.IptvNowNext?
+    ): MediaItem {
+        val stableId = channel.id.hashCode() and 0x7FFFFFFF
+        iptvChannelMap[stableId] = channel
+
+        val nowProgram = epg?.now
+        val nextProgram = epg?.next ?: epg?.later ?: epg?.upcoming?.firstOrNull()
+        val timeFmt = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).apply {
+            timeZone = java.util.TimeZone.getDefault()
+        }
+        fun fmtRange(p: com.arflix.tv.data.model.IptvProgram): String {
+            val s = timeFmt.format(java.util.Date(p.startUtcMillis))
+            val e = timeFmt.format(java.util.Date(p.endUtcMillis))
+            return "$s - $e"
+        }
+        val overviewParts = mutableListOf<String>()
+        if (nowProgram != null) {
+            overviewParts.add("Now: ${fmtRange(nowProgram)}  ${nowProgram.title}")
+            if (!nowProgram.description.isNullOrBlank()) {
+                overviewParts.add(nowProgram.description)
+            }
+        }
+        if (nextProgram != null) {
+            overviewParts.add("Next: ${fmtRange(nextProgram)}  ${nextProgram.title}")
+        }
+
+        return MediaItem(
+            id = stableId,
+            title = channel.name,
+            subtitle = channel.group,
+            overview = overviewParts.joinToString("\n").ifBlank { "Live TV" },
+            mediaType = MediaType.TV,
+            image = channel.logo ?: "",
+            backdrop = channel.logo,
+            badge = "LIVE",
+            status = "$IPTV_STATUS_PREFIX${channel.id}",
+            isOngoing = true
+        )
+    }
+
+    /**
+     * Outcome of building the Favorite TV row.
+     *
+     * "Could not build it" and "the user has no favorites" are NOT the same thing.
+     * [IptvRepository.invalidateCache] wipes the in-memory channel list whenever the
+     * playlist config signature or active profile changes, and the disk fallback can
+     * miss while a refresh is re-parsing, so a perfectly normal refresh pass can find
+     * zero channels. Collapsing that into `null` made the caller delete a row that was
+     * already on screen — the row appeared on load and then vanished a moment later.
+     */
+    private sealed interface FavoriteTvOutcome {
+        data class Available(val category: Category) : FavoriteTvOutcome
+
+        /** Authoritatively empty — the row should be dropped. */
+        data object Empty : FavoriteTvOutcome
+
+        /** IPTV cache not hydrated on this pass — leave the displayed row alone. */
+        data object Unavailable : FavoriteTvOutcome
+    }
+
+    private suspend fun buildFavoriteTvOutcome(): FavoriteTvOutcome {
+        // Switched off in Settings > IPTV. Reported as Empty (not Unavailable) so the
+        // row is actively removed, and so the progressive additive passes — which append
+        // the row without consulting savedCatalogs — cannot resurrect it.
+        if (!isIptvFavoritesOnHomeEnabled()) return FavoriteTvOutcome.Empty
+        // Use non-blocking memory read first; fall back to disk snapshot read
+        val snapshot = iptvRepository.getMemoryCachedSnapshot()
+            ?: iptvRepository.getCachedSnapshotOrNull()
+            ?: return FavoriteTvOutcome.Unavailable
+        // favoriteChannels is read straight from DataStore, so an empty set is
+        // authoritative even when the channel cache is stone cold.
+        val favoriteIds = snapshot.favoriteChannels.filter { it.isNotBlank() }
+        if (favoriteIds.isEmpty()) return FavoriteTvOutcome.Empty
+
+        // snapshot.channels is only the currently-paged window — on a large playlist
+        // that is a couple hundred rows out of tens of thousands, and a starred channel
+        // is very unlikely to be in it. Filtering it (the old behaviour) therefore found
+        // nothing and the row silently never appeared. Resolve the in-memory page first,
+        // then fetch whatever is left straight from the SQLite channel store by id.
+        val byId = HashMap<String, com.arflix.tv.data.model.IptvChannel>(favoriteIds.size)
+        val favoriteIdSet = favoriteIds.toHashSet()
+        snapshot.channels.forEach { channel ->
+            if (channel.id in favoriteIdSet) byId[channel.id] = channel
+        }
+        val missing = favoriteIds.filterNot { byId.containsKey(it) }
+        if (missing.isNotEmpty()) {
+            iptvRepository.pagedChannelsByIds(missing).forEach { byId[it.id] = it }
+        }
+
+        if (byId.isEmpty()) {
+            // Nothing resolved. Only call that authoritative once the channel data is
+            // actually loaded; otherwise this is a cold cache and the row must stay put.
+            val storeReady = snapshot.channels.isNotEmpty() ||
+                runCatching { iptvRepository.pagedChannelsReady() }.getOrDefault(false)
+            return if (storeReady) FavoriteTvOutcome.Empty else FavoriteTvOutcome.Unavailable
+        }
+
+        // Re-derive now/next from cached programs so "Now" shifts when a program ends.
+        // This is free (no network) — just recalculates which program is live.
+        iptvRepository.reDeriveCachedNowNext(byId.keys.toSet())
+        val nowNext = (iptvRepository.getMemoryCachedSnapshot() ?: snapshot).nowNext
+
+        // Keep the user's own favourite ordering — the paged store has no meaningful
+        // list order to inherit, and this matches how the Live TV favourites category
+        // is ordered.
+        val items = favoriteIds.mapNotNull { id ->
+            val channel = byId[id] ?: return@mapNotNull null
+            iptvChannelToMediaItem(channel, nowNext[id])
+        }
+        if (items.isEmpty()) return FavoriteTvOutcome.Empty
+
+        return FavoriteTvOutcome.Available(
+            Category(
+                id = FAVORITE_TV_CATEGORY_ID,
+                title = "Favorite TV",
+                items = items
+            )
+        )
+    }
+
+    /** Additive callers only: they insert the row when present and never remove it. */
+    private suspend fun buildFavoriteTvCategory(): Category? =
+        (buildFavoriteTvOutcome() as? FavoriteTvOutcome.Available)?.category
+
+    /** Settings > IPTV > "Show IPTV favorites on home". Defaults to on. */
+    private suspend fun isIptvFavoritesOnHomeEnabled(): Boolean = runCatching {
+        val prefs = context.settingsDataStore.data.first()
+        prefs[profileManager.profileBooleanKey(IPTV_FAVORITES_ON_HOME)] ?: true
+    }.getOrDefault(true)
+
+    private fun isCustomCatalogConfig(cfg: CatalogConfig): Boolean {
+        if (cfg.kind == CatalogKind.COLLECTION || cfg.kind == CatalogKind.COLLECTION_RAIL) {
+            return false
+        }
+        return !cfg.isPreinstalled ||
+            cfg.id.startsWith("custom_") ||
+            !cfg.sourceUrl.isNullOrBlank() ||
+            !cfg.sourceRef.isNullOrBlank()
+    }
+
+    private fun isCollectionRailConfig(cfg: CatalogConfig): Boolean = cfg.kind == CatalogKind.COLLECTION_RAIL
+
+    private fun isCollectionTileConfig(cfg: CatalogConfig): Boolean = cfg.kind == CatalogKind.COLLECTION
+
+    private fun isSportsCatalogRow(categoryId: String): Boolean =
+        categoryId == SportsAddonCapabilities.SPORTS_CATEGORY_ROW_ID ||
+            categoryId == SportsAddonCapabilities.POPULAR_LIVE_TV_ROW_ID
+
+    private fun collectionRowId(railKey: String): String {
+        return "collection_row_${railKey.lowercase(Locale.US)}"
+    }
+
+    private fun hasRealItems(category: Category?): Boolean {
+        return category?.items?.any { !it.isPlaceholder } == true
+    }
+
+    private fun isEligibleHeroItem(item: MediaItem?): Boolean {
+        if (item == null) return false
+        if (item.id <= 0 || item.isPlaceholder) return false
+        if (item.title.isBlank() || item.title.equals("Unknown", ignoreCase = true)) return false
+        if (isSportsHomeItem(item) || SportsAddonCapabilities.isSportsLockedStatus(item.status)) return false
+        if (isIptvItem(item) || isCollectionItem(item)) return false
+        return true
+    }
+
+    private fun chooseInitialHero(categories: List<Category>): MediaItem? {
+        val preferredRow = categories.firstOrNull { category ->
+            !category.id.startsWith("collection_row_") &&
+                !isSportsCatalogRow(category.id) &&
+                category.items.any { isEligibleHeroItem(it) }
+        }
+        return preferredRow?.items?.firstOrNull { isEligibleHeroItem(it) }
+            ?: categories.asSequence()
+                .filterNot { isSportsCatalogRow(it.id) || it.id.startsWith("collection_row_") }
+                .flatMap { it.items.asSequence() }
+                .firstOrNull { isEligibleHeroItem(it) }
+    }
+
+    /**
+     * Refresh the Favorite TV category's EPG data (Now/Next display).
+     * @param networkFetch If true, the network is asked when the saved guide has no current
+     *                     programme for a favorite channel (at most every [EPG_NETWORK_RETRY_MS]).
+     *                     If false, only re-derive from cached program data (free, no network).
+     */
+    private fun refreshFavoriteTvEpg(networkFetch: Boolean = false) {
+        activeEpgRefreshJob?.cancel()
+        activeEpgRefreshJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val categories = _uiState.value.categories
+                val favTvIndex = categories.indexOfFirst { it.id == FAVORITE_TV_CATEGORY_ID }
+                if (favTvIndex < 0) return@launch
+
+                val currentFavTv = categories[favTvIndex]
+                // Collect channel IDs from current items
+                val channelIds = currentFavTv.items.mapNotNull { getIptvChannelId(it) }.toSet()
+                if (channelIds.isEmpty()) return@launch
+
+                // The saved guide usually covers days ahead, so now/next comes from it. An XMLTV
+                // source has no per-channel request: a "refresh" downloads the whole guide.
+                val derived = iptvRepository.reDeriveCachedNowNext(channelIds)
+                val now = SystemClock.elapsedRealtime()
+                if (networkFetch && favoriteTvGuideNeedsNetwork(
+                        channelIds, derived, lastEpgNetworkRefreshMs, now, EPG_NETWORK_RETRY_MS)
+                ) {
+                    lastEpgNetworkRefreshMs = now
+                    runCatching { iptvRepository.refreshEpgForChannels(channelIds) }
+                    iptvRepository.reDeriveCachedNowNext(channelIds)
+                }
+
+                // Rebuild the category with updated EPG text
+                val freshCategory = withContext(Dispatchers.IO) {
+                    runCatching { buildFavoriteTvCategory() }.getOrNull()
+                } ?: return@launch
+
+                // Check if anything actually changed to avoid needless recomposition
+                val oldOverviews = currentFavTv.items.map { it.overview }
+                val newOverviews = freshCategory.items.map { it.overview }
+                if (oldOverviews == newOverviews) return@launch
+
+                // Apply user-renamed title if applicable
+                val cfg = savedCatalogById[FAVORITE_TV_CATEGORY_ID]
+                val titled = if (cfg != null && cfg.title.isNotBlank() && cfg.title != freshCategory.title) {
+                    freshCategory.copy(title = cfg.title)
+                } else {
+                    freshCategory
+                }
+
+                withContext(Dispatchers.Main.immediate) {
+                    val current = _uiState.value.categories.toMutableList()
+                    val idx = current.indexOfFirst { it.id == FAVORITE_TV_CATEGORY_ID }
+                    if (idx >= 0) {
+                        current[idx] = titled
+                        _uiState.value = _uiState.value.copy(categories = current)
+                        System.err.println("[EPG-Refresh] Updated Favorite TV row (network=$networkFetch)")
+                    }
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                AppLogger.e("HomeVM", "[EPG-Refresh] Error: ${e.message}", e)
+            }
+        }
+    }
+
+    /**
+     * After the active IPTV sources change, the home load finds the new channel list still loading,
+     * reports the Favorite TV row as unavailable and keeps it — with the old sources' channels,
+     * until a restart. Rebuild it once the new list can be read: replace it, or remove it when the
+     * new sources have no favourites. If the list never becomes readable, the stale row goes too.
+     */
+    private suspend fun rebuildFavoriteTvAfterSourceChange() {
+        repeat(FAVORITE_TV_SOURCE_CHANGE_ATTEMPTS) { attempt ->
+            delay(if (attempt == 0) 500L else FAVORITE_TV_SOURCE_CHANGE_RETRY_MS)
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching { buildFavoriteTvOutcome() }.getOrDefault(FavoriteTvOutcome.Unavailable)
+            }
+            when (outcome) {
+                is FavoriteTvOutcome.Available -> {
+                    val cfg = savedCatalogById[FAVORITE_TV_CATEGORY_ID]
+                    val titled = if (cfg != null && cfg.title.isNotBlank()) {
+                        outcome.category.copy(title = cfg.title)
+                    } else {
+                        outcome.category
+                    }
+                    updateMobileCategoryRow(FAVORITE_TV_CATEGORY_ID, titled)
+                    return
+                }
+                FavoriteTvOutcome.Empty -> {
+                    removeFavoriteTvRow()
+                    return
+                }
+                FavoriteTvOutcome.Unavailable -> Unit
+            }
+        }
+        removeFavoriteTvRow()
+    }
+
+    private fun removeFavoriteTvRow() {
+        val categories = _uiState.value.categories
+        if (categories.none { it.id == FAVORITE_TV_CATEGORY_ID }) return
+        _uiState.value = _uiState.value.copy(categories = categories.filterNot { it.id == FAVORITE_TV_CATEGORY_ID })
+    }
+
+    /**
+     * The Favorite TV row's now/next only shows on a focused card, so it is brought up to date
+     * when focus reaches the row, not on a timer. A Home screen left open used to download the
+     * whole guide every five minutes for text nobody was looking at.
+     */
+    private fun refreshFavoriteTvGuideOnFocus() {
+        val now = SystemClock.elapsedRealtime()
+        if (!favoriteTvFocusRefreshDue(lastFavoriteTvFocusRefreshMs, now, EPG_FOCUS_REFRESH_MS)) return
+        lastFavoriteTvFocusRefreshMs = now
+        refreshFavoriteTvEpg(networkFetch = true)
+    }
+
+    private val isTvDevice = detectDeviceType(context) == DeviceType.TV
+    private val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    private val isLowRamDevice =
+        activityManager.isLowRamDevice ||
+            activityManager.memoryClass <= 256 ||
+            (isTvDevice && activityManager.memoryClass <= 384)
+    private val gson = com.google.gson.Gson()
+
+    // Disk cache key for the home categories — profile-scoped so each profile gets
+    // its own cached home screen. On app launch, the cached categories are shown
+    // immediately (within 1 frame) while loadHomeData() fetches fresh data from
+    // TMDB in the background. This eliminates the visible skeleton/loading phase
+    // that made the app feel slow on startup.
+    // Use a plain file in the cache dir instead of DataStore — DataStore has
+    // a size limit and the categories JSON can be 200KB+. A cache file is faster
+    // to read/write and doesn't trigger DataStore observers.
+    private fun categoriesCacheFile(): java.io.File {
+        val profileId = profileManager.getProfileIdSync()
+            .ifBlank { "default" }
+            .replace(HomeVMRegexes.ALPHANUMERIC_REGEX, "_")
+        val language = mediaRepository.contentLanguage
+            .replace(HomeVMRegexes.ALPHANUMERIC_REGEX, "_")
+        return java.io.File(context.cacheDir, "home_categories_cache_${profileId}_$language.json")
+    }
+
+    private suspend fun continueWatchingCacheFile(): java.io.File {
+        val profileId = profileManager.getProfileIdSync()
+            .ifBlank { "default" }
+            .replace(HomeVMRegexes.ALPHANUMERIC_REGEX, "_")
+        val language = mediaRepository.contentLanguage
+            .replace(HomeVMRegexes.ALPHANUMERIC_REGEX, "_")
+        // v2 invalidates the old snapshot, which could contain a mixed or
+        // truncated provider result and would otherwise paint before Trakt
+        // had a chance to publish the corrected list.
+        //
+        // The tracker is part of the name for the same reason it is part of the
+        // repository's key: this file is what Home paints before any network
+        // call returns, and each tracker answers with a different list.
+        val provider = runCatching { remoteSyncManager.selectedProvider().name.lowercase(java.util.Locale.US) }
+            .getOrDefault("none")
+        return java.io.File(
+            context.filesDir,
+            "home_continue_watching_v2_${profileId}_${language}_$provider.json"
+        )
+    }
+
+    private suspend fun applyContentLanguageFromPrefs(): String {
+        val prefs = context.settingsDataStore.data.first()
+        val profileId = profileManager.getProfileId()
+        val language = resolveAppLanguage(prefs, profileId)
+        mediaRepository.contentLanguage = language
+        return language
+    }
+
+    private fun persistCategoriesCache(categories: List<Category>) {
+        val cacheable = compactHomeCategoriesForCache(
+            categories = categories,
+            maxItemsPerCategory = homeCacheItemsPerCategory
+        )
+        if (cacheable.isEmpty()) return
+        runCatching {
+            val target = categoriesCacheFile()
+            val temporary = java.io.File(target.parentFile, "${target.name}.tmp")
+            temporary.writeText(gson.toJson(cacheable))
+            if (temporary.length() > maxCategoriesCacheBytes) {
+                temporary.delete()
+                return@runCatching
+            }
+            if (target.exists() && !target.delete()) {
+                temporary.delete()
+                return@runCatching
+            }
+            if (!temporary.renameTo(target)) {
+                temporary.copyTo(target, overwrite = true)
+                temporary.delete()
+            }
+        }
+    }
+
+    private suspend fun persistContinueWatchingCache(items: List<ContinueWatchingItem>) {
+        if (items.isEmpty()) return
+        runCatching {
+            val target = continueWatchingCacheFile()
+            val temporary = java.io.File(target.parentFile, "${target.name}.tmp")
+            temporary.writeText(gson.toJson(items.take(Constants.MAX_CONTINUE_WATCHING)))
+            if (target.exists() && !target.delete()) {
+                temporary.delete()
+                return@runCatching
+            }
+            if (!temporary.renameTo(target)) {
+                temporary.copyTo(target, overwrite = true)
+                temporary.delete()
+            }
+        }
+    }
+
+    private suspend fun loadContinueWatchingCache(): List<ContinueWatchingItem> = runCatching {
+        val file = continueWatchingCacheFile()
+        if (!file.exists() || file.length() > maxContinueWatchingCacheBytes) return emptyList()
+        val json = file.readText()
+        if (json.isBlank()) return emptyList()
+        val parsed = com.arflix.tv.data.repository.decodeContinueWatchingCache(json, gson)
+        parsed.filter { it.id > 0 && it.title.isNotBlank() }.take(Constants.MAX_CONTINUE_WATCHING)
+    }.getOrDefault(emptyList())
+
+    private fun loadCategoriesCache(): List<Category> {
+        return runCatching {
+            val file = categoriesCacheFile()
+            if (!file.exists()) return emptyList()
+            if (file.length() > maxCategoriesCacheBytes) {
+                file.delete()
+                return emptyList()
+            }
+            val json = file.readText()
+            if (json.isBlank()) return emptyList()
+            val type = com.google.gson.reflect.TypeToken
+                .getParameterized(MutableList::class.java, Category::class.java)
+                .type
+            val parsed: List<Category> = gson.fromJson(json, type) ?: emptyList()
+            var hadBlankTitles = false
+            val sanitized = parsed.map { cat ->
+                val cleanItems = cat.items.filter { item ->
+                    val isValid = item.title.isNotBlank() && item.title != "Unknown"
+                    if (!isValid) hadBlankTitles = true
+                    if (isValid) {
+                        mediaRepository.cacheItem(item)
+                    }
+                    isValid
+                }
+                cat.copy(items = cleanItems)
+            }.filter { it.items.isNotEmpty() }
+
+            if (hadBlankTitles) {
+                file.delete()
+            }
+            sanitized
+        }.getOrDefault(emptyList())
+    }
+    // IO concurrency for network requests (logo fetches, catalog loads, etc.)
+    private val networkParallelism = if (isLowRamDevice) 4 else 8
+    private val networkDispatcher = Dispatchers.IO.limitedParallelism(networkParallelism)
+    private var lastContinueWatchingItems: List<MediaItem> = emptyList()
+    private var lastContinueWatchingUpdateMs: Long = 0L
+    private var lastResolvedBaseCategories: List<Category> = emptyList()
+    private val dismissedContinueWatchingAt = Collections.synchronizedMap(mutableMapOf<String, Long>())
+    private val CONTINUE_WATCHING_REFRESH_MS = 45_000L
+    private val WATCHED_BADGES_REFRESH_MS = 90_000L
+
+    /**
+     * How old the catalog rows may get before returning to Home re-fetches them.
+     *
+     * Home is no longer rebuilt on every return (its back-stack entry — and so this ViewModel —
+     * now survives navigation to Watchlist/TV/Search), which is what made returning instant. The
+     * rebuild used to double as the refresh, so without a check here the rows would keep whatever
+     * they loaded for as long as the process lives. Continue Watching has its own, much shorter
+     * refresh above; this covers the slow-moving catalog rows.
+     *
+     * Most of a refresh is served from the HTTP disk cache, and TMDB's own `max-age` decides what
+     * genuinely goes to the network (trending ~8 min, show metadata several hours).
+     */
+    private val HOME_DATA_STALE_AFTER_MS = 6 * 60 * 60 * 1000L
+
+    /**
+     * Elapsed-realtime mark of the last SUCCESSFUL [loadHomeData]; 0 until one completes.
+     * A load that failed must not mark Home fresh, or one transient network error would
+     * suppress the resume refresh for the whole TTL.
+     */
+    private var lastHomeDataLoadAtMs = 0L
+
+    /** True once [loadHomeData] has been started at least once, successfully or not. */
+    private var homeDataLoadAttempted = false
+    private var lastWatchedBadgesRefreshMs: Long = 0L
+    @Volatile private var lastWatchedBadgesCategories: List<Category>? = null
+    @Volatile private var watchedBadgesQuickPending = false
+    // What the last pass found watched (films, started shows), to mark re-published rows at once.
+    @Volatile private var lastWatchedBadgesLookup: Pair<Set<Int>, Set<Int>>? = null
+    private val HOME_PLACEHOLDER_ITEM_COUNT = 8
+
+    // EPG refresh for the Favorite TV row, driven by focus (see refreshFavoriteTvGuideOnFocus)
+    /** Moving between cards re-derives now/next from the saved guide at most this often. */
+    private val EPG_FOCUS_REFRESH_MS = 60_000L
+    /** After an IPTV source change, how long the Favorite TV row waits for the new channel list. */
+    private val FAVORITE_TV_SOURCE_CHANGE_ATTEMPTS = 30
+    private val FAVORITE_TV_SOURCE_CHANGE_RETRY_MS = 2_000L
+    /** How often the network may be asked while the saved guide lacks a current programme. */
+    private val EPG_NETWORK_RETRY_MS = 30 * 60_000L
+    private var activeEpgRefreshJob: Job? = null
+    private var lastEpgNetworkRefreshMs: Long = 0L
+    private var lastFavoriteTvFocusRefreshMs: Long = 0L
+
+    private val _uiState = MutableStateFlow(HomeUiState())
+    val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
+
+    // Kept out of uiState: Home rewrites that state from many coroutines, which would cut the
+    // notice short. Null when nothing is shown.
+    private val _quietUpdateNotice = MutableStateFlow<String?>(null)
+    val quietUpdateNotice: StateFlow<String?> = _quietUpdateNotice.asStateFlow()
+
+    fun dismissQuietUpdateNotice() {
+        _quietUpdateNotice.value = null
+    }
+    val cardLogoUrls = mutableStateMapOf<String, String>()
+    val cardImdbRatings = mutableStateMapOf<String, String>()
+
+    // Debounce job for hero updates (Phase 6.1)
+    private var heroUpdateJob: Job? = null
+    private var heroDetailsJob: Job? = null
+    private var heroTrailerJob: Job? = null
+    private var heroTrailerRequestKey: String? = null
+    private data class CachedHomeTrailer(val key: String?, val cachedAt: Long = SystemClock.elapsedRealtime())
+    private val heroTrailerCache = android.util.LruCache<String, CachedHomeTrailer>(64)
+    private var prefetchJob: Job? = null
+    private var preloadCategoryPriorityJob: Job? = null
+    private val preloadCategoryJobs = ConcurrentHashMap<Int, Job>()
+    private var startupCatalogWarmupJob: Job? = null
+    private var customCatalogsJob: Job? = null
+    private var loadHomeJob: Job? = null
+    private val listRowsReloadJobs = ConcurrentHashMap<PersonalListsRepository.Provider, Job>()
+    private var refreshContinueWatchingJob: Job? = null
+    private val continueWatchingRequests = ContinueWatchingRefreshRequests()
+    private var cwFetchJob: Job? = null
+    @Volatile private var homeTrackingRevision = 0L
+    private var watchedBadgesJob: Job? = null
+    private var loadHomeRequestId: Long = 0L
+    private var activeRuntimeProfileId: String? = null
+    private var observedContentLanguage: String? = null
+    private var observedIptvFavoritesOnHome: Boolean? = null
+    private val HERO_DEBOUNCE_MS = 80L // Short debounce; focus idle is handled in HomeScreen
+    private val startupCreatedAtMs = SystemClock.elapsedRealtime()
+    private val startupSettleMs = if (isLowRamDevice) 5_000L else 4_000L
+
+    // Phase 6.2-6.3: Fast scroll detection
+    private var lastFocusChangeTime = 0L
+    private var consecutiveFastChanges = 0
+    private val FAST_SCROLL_THRESHOLD_MS = 650L  // Under 650ms = fast scrolling
+    private val FAST_SCROLL_DEBOUNCE_MS = 220L   // Keep hero responsive without updating every key repeat
+
+    private val FOCUS_PREFETCH_COALESCE_MS = if (isLowRamDevice) 180L else 120L
+    private val BACKDROP_IDLE_PREFETCH_MS = if (isLowRamDevice) 220L else 160L
+
+    private val homeLandscapeCardWidthDp =
+        if (isTvDevice) HOME_TV_LANDSCAPE_CARD_WIDTH_DP else HOME_MOBILE_LANDSCAPE_CARD_WIDTH_DP
+    private val homeLogoWidthDp = 220
+    private val homeLogoHeightDp = 64
+    private val logoPreloadWidth = (homeLogoWidthDp * context.resources.displayMetrics.density)
+        .toInt()
+        .coerceAtLeast(1)
+    private val logoPreloadHeight = (homeLogoHeightDp * context.resources.displayMetrics.density)
+        .toInt()
+        .coerceAtLeast(1)
+    private val cardBackdropSize = landscapeCardPixelSize(
+        homeLandscapeCardWidthDp,
+        context.resources.displayMetrics.density
+    )
+    private val backdropPreloadWidth = cardBackdropSize.first
+    private val backdropPreloadHeight = cardBackdropSize.second
+    private val initialLogoPrefetchRows = 1
+    private val initialLogoPrefetchItemsPerRow = if (isLowRamDevice) 1 else 2
+    // Prefetch enough backdrops to fill the first visible row on the home screen
+    // (typically 6-8 cards on a TV). Was 2, which left the majority of the first
+    // row unpreloaded on cold start, causing visible black -> image pop-in.
+    private val initialBackdropPrefetchItems = if (isLowRamDevice) 4 else 8
+    private val incrementalLogoPrefetchItems = if (isLowRamDevice) 4 else 6
+    private val prioritizedLogoPrefetchItems = if (isLowRamDevice) 5 else 7
+    private val incrementalBackdropPrefetchItems = if (isLowRamDevice) 4 else 7
+    private val startupWarmupCategoryCount = if (isLowRamDevice) 5 else 8
+    private val startupWarmupItemsPerRow = if (isLowRamDevice) 5 else 8
+    private val initialCategoryItemCap = if (isLowRamDevice) 8 else 10
+    private val categoryPageSize = if (isLowRamDevice) 8 else 10
+    private val initialMdblistCatalogCount = 1
+    private val nearEndThreshold = 4
+    // Home rails stop auto-paging here so their trailing "View all" card stays reachable
+    // with the D-pad; the rest of the catalog pages in the "View all" grid.
+    private val homeRowAutoPageLimit = 60
+
+    // Track current focus for ahead-of-focus preloading
+    private var currentRowIndex = 0
+    private var currentItemIndex = 0
+
+    // Track if preloaded data was used to avoid duplicate loading
+    private var usedPreloadedData = false
+
+    private val maxLogoCacheEntries = if (isLowRamDevice) 220 else 420
+    private val maxLogoCacheJsonChars = if (isLowRamDevice) 250_000 else 500_000
+    private val homeCacheItemsPerCategory = if (isLowRamDevice) 12 else 16
+    // Older builds persisted complete 40-item rows, so allow one migration read of
+    // those snapshots. New writes are compact and normally stay well below 2 MB.
+    private val maxCategoriesCacheBytes = if (isLowRamDevice) 8_000_000L else 12_000_000L
+    private val maxContinueWatchingCacheBytes = 2_000_000L
+    private val logoCacheLock = Any()
+    private val logoCache = LinkedHashMap<String, String>(maxLogoCacheEntries + 32, 0.75f, true)
+    private var logoCacheRevision: Long = 0L
+    private var lastPublishedLogoCacheRevision: Long = -1L
+    private val logoCachePrefs = context.getSharedPreferences("logo_cache", Context.MODE_PRIVATE)
+    private var logoCacheDiskWriteJob: Job? = null
+    private val logoFetchInFlight = Collections.synchronizedSet(mutableSetOf<String>())
+    private val heroDetailsCache = ConcurrentHashMap<String, HeroDetailsSnapshot>()
+    private val heroDetailsFetchInFlight = Collections.synchronizedSet(mutableSetOf<String>())
+    private val heroDetailsPrefetchSemaphore = Semaphore(if (isLowRamDevice) 1 else 2)
+    @Volatile
+    private var currentSavedCatalogs: List<CatalogConfig> = emptyList()
+    private val savedCatalogById = ConcurrentHashMap<String, CatalogConfig>()
+    private val categoryPaginationStates = ConcurrentHashMap<String, CategoryPaginationState>()
+
+    init {
+        // A list edited through "Add to list" is shown fresh at once, not after the next reload.
+        viewModelScope.launch {
+            personalListsRepository.changes.collect { list -> reloadRowsFor(list.provider) }
+        }
+        // Continue Watching silently stops syncing when the Trakt session is lost; say so once
+        // per app run and profile instead of leaving the user to find it in Settings.
+        viewModelScope.launch {
+            traktRepository.connection
+                .filter { it.reconnectRequired }
+                .collect { connection ->
+                    if (traktReconnectNoticeShown.add(connection.profileId)) {
+                        _uiState.value = _uiState.value.copy(
+                            toastMessage = context.getString(R.string.trakt_reconnect_required),
+                            toastType = ToastType.ERROR
+                        )
+                    }
+                }
+        }
+        viewModelScope.launch {
+            personalListsRepository.mdbListConnection
+                .filter { it.connected && it.reconnectRequired }
+                .collect { connection ->
+                    if (mdbListReconnectNoticeShown.add(connection.profileId)) {
+                        _uiState.value = _uiState.value.copy(
+                            toastMessage = context.getString(R.string.mdblist_reconnect_required),
+                            toastType = ToastType.ERROR
+                        )
+                    }
+                }
+        }
+    }
+
+    /**
+     * Reloads every Home row that comes from [provider]'s lists, in place. A row cannot be
+     * tied to one list id reliably (rows keep the list's URL, the picker its numeric id), and a
+     * user has few such rows, so all of that service's rows are reloaded.
+     */
+    private fun reloadRowsFor(provider: PersonalListsRepository.Provider) {
+        val sourceType = when (provider) {
+            PersonalListsRepository.Provider.TRAKT -> CatalogSourceType.TRAKT
+            PersonalListsRepository.Provider.MDBLIST -> CatalogSourceType.MDBLIST
+        }
+        // The rows belong to the profile and Home load they started on. A profile switch or a
+        // new Home load while they are fetched makes them stale: they are dropped, not merged
+        // into the next profile's Home (or over a newer load's rows and paging).
+        val profileId = profileManager.getProfileIdSync()
+        val requestId = loadHomeRequestId
+        fun isCurrent() = profileManager.getProfileIdSync() == profileId && loadHomeRequestId == requestId
+        listRowsReloadJobs.remove(provider)?.cancel()
+        listRowsReloadJobs[provider] = viewModelScope.launch(networkDispatcher) {
+            val catalogs = runCatching { catalogRepository.getCatalogs() }.getOrDefault(emptyList())
+                .filter { it.sourceType == sourceType }
+            for (catalog in catalogs) {
+                if (!isCurrent()) return@launch
+                val page = runCatching {
+                    mediaRepository.loadCustomCatalogPage(catalog, offset = 0, limit = catalogInitialLimit(catalog))
+                }.getOrNull() ?: continue
+                withContext(Dispatchers.Main.immediate) {
+                    if (!isCurrent()) return@withContext
+                    categoryPaginationStates[catalog.id] = CategoryPaginationState(
+                        loadedCount = page.items.size,
+                        hasMore = page.hasMore,
+                        nextOffset = page.nextOffset ?: page.items.size
+                    )
+                    val state = _uiState.value
+                    val index = state.categories.indexOfFirst { it.id == catalog.id }
+                    val categories = state.categories.toMutableList()
+                    when {
+                        index >= 0 && page.items.isEmpty() -> categories.removeAt(index)
+                        index >= 0 -> categories[index] = categories[index].copy(items = page.items)
+                        page.items.isNotEmpty() -> categories.add(Category(catalog.id, catalog.title, page.items))
+                        else -> return@withContext
+                    }
+                    _uiState.value = state.copy(
+                        categories = categories,
+                        categoryHasMoreMap = categoryPaginationStates.mapValues { it.value.hasMore }
+                    )
+                }
+            }
+        }
+    }
+    private val preloadedRequests: MutableSet<String> = run {
+        val backingMap = object : java.util.LinkedHashMap<String, Boolean>(1200, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>): Boolean {
+                return size > 1200
+            }
+        }
+        Collections.synchronizedSet(Collections.newSetFromMap(backingMap))
+    }
+    private var logoCachePublishJob: Job? = null
+    @Volatile
+    private var pendingLogoPublishPriority: Boolean = false
+    private var lastLogoCachePublishMs: Long = 0L
+    private val LOGO_CACHE_PUBLISH_THROTTLE_MS = if (isLowRamDevice) 650L else 420L
+    private val LOGO_CACHE_IDLE_REQUIRED_MS = if (isLowRamDevice) 520L else 360L
+    private val LOGO_CACHE_FAST_SCROLL_IDLE_MS = if (isLowRamDevice) 320L else 220L
+
+    private fun getCachedLogo(key: String): String? = synchronized(logoCacheLock) {
+        logoCache[key]
+    }
+
+    private fun isStartupSettling(): Boolean {
+        return SystemClock.elapsedRealtime() - startupCreatedAtMs < startupSettleMs
+    }
+
+    private suspend fun delayUntilStartupSettled(extraDelayMs: Long = 0L) {
+        val waitMs = (startupCreatedAtMs + startupSettleMs + extraDelayMs) -
+            SystemClock.elapsedRealtime()
+        if (waitMs > 0L) {
+            delay(waitMs)
+        }
+    }
+
+    private fun scheduleInitialHomeLoad() {
+        viewModelScope.launch {
+            applyContentLanguageFromPrefs()
+            delay(if (isLowRamDevice) 1_000L else 800L)
+            if (
+                usedPreloadedData ||
+                _uiState.value.categories.isNotEmpty() ||
+                _uiState.value.heroItem != null
+            ) {
+                delayUntilStartupSettled(extraDelayMs = 700L)
+            }
+            loadHomeData()
+        }
+    }
+
+    private fun scheduleStartupImageWarmup(
+        logoUrls: List<String> = emptyList(),
+        backdropUrls: List<String> = emptyList()
+    ) {
+        if (logoUrls.isEmpty() && backdropUrls.isEmpty()) return
+        viewModelScope.launch(networkDispatcher) {
+            delayUntilStartupSettled(1_200L)
+            if (logoUrls.isNotEmpty()) {
+                preloadLogoImages(
+                    logoUrls,
+                    batchLimit = if (isLowRamDevice) 2 else 3
+                )
+            }
+            if (backdropUrls.isNotEmpty()) {
+                preloadBackdropImages(backdropUrls)
+            }
+        }
+    }
+
+    private fun scheduleStartupCatalogImageWarmup(categories: List<Category>) {
+        if (categories.isEmpty()) return
+        startupCatalogWarmupJob?.cancel()
+        val warmupRows = categories
+            .asSequence()
+            .filterNot { it.id.startsWith("collection_row_") }
+            .take(startupWarmupCategoryCount)
+            .toList()
+        if (warmupRows.isEmpty()) return
+
+        startupCatalogWarmupJob = viewModelScope.launch(networkDispatcher) {
+            delayUntilStartupSettled(if (isLowRamDevice) 1_600L else 1_000L)
+            warmupRows.forEach { category ->
+                val backdropUrls = category.items
+                    .take(startupWarmupItemsPerRow)
+                    .mapNotNull { it.backdrop ?: it.image }
+                if (backdropUrls.isNotEmpty()) {
+                    preloadBackdropImages(backdropUrls)
+                }
+                delay(if (isLowRamDevice) 260L else 160L)
+            }
+        }
+    }
+
+    private fun scheduleStartupHeroHydration(item: MediaItem) {
+        if (!_uiState.value.heroItem.isSameHomeHero(item) || isCollectionItem(item)) return
+        heroDetailsJob?.cancel()
+        heroDetailsJob = viewModelScope.launch(networkDispatcher) {
+            delay(if (isLowRamDevice) 700L else 300L)
+            val currentHero = _uiState.value.heroItem
+            if (currentHero?.id == item.id && currentHero.mediaType == item.mediaType) {
+                hydrateHeroDetailsIfNeeded(item)
+            }
+        }
+    }
+
+    private fun resetProfileRuntimeState(profileId: String) {
+        _homeWatchlistItems.value = emptyList()
+        continueWatchingRequests.reset()
+        loadHomeJob?.cancel()
+        refreshContinueWatchingJob?.cancel()
+        cwFetchJob?.cancel()
+        cwFetchJob = null
+        watchedBadgesJob?.cancel()
+        preloadCategoryPriorityJob?.cancel()
+        preloadCategoryJobs.values.forEach { it.cancel() }
+        preloadCategoryJobs.clear()
+        startupCatalogWarmupJob?.cancel()
+        customCatalogsJob?.cancel()
+        listRowsReloadJobs.values.forEach { it.cancel() }
+        listRowsReloadJobs.clear()
+        activeEpgRefreshJob?.cancel()
+        lastFavoriteTvFocusRefreshMs = 0L
+        lastContinueWatchingItems = emptyList()
+        lastContinueWatchingUpdateMs = 0L
+        // The next profile's rows arrive unmarked; its first tick pass must not wait out the
+        // throttle of the previous profile.
+        lastWatchedBadgesRefreshMs = 0L
+        lastWatchedBadgesCategories = null
+        lastWatchedBadgesLookup = null
+        watchedBadgesQuickPending = false
+        lastResolvedBaseCategories = emptyList()
+        dismissedContinueWatchingAt.clear()
+        categoryPaginationStates.clear()
+        currentSavedCatalogs = emptyList()
+        savedCatalogById.clear()
+        collectionCatalogByMediaId.clear()
+        iptvChannelMap.clear()
+        traktRepository.clearAllProfileCaches()
+        watchlistRepository.clearWatchlistCache()
+        watchHistoryRepository.clearProfileCaches()
+        iptvRepository.invalidateCache()
+        _uiState.value = HomeUiState(syncStatus = _uiState.value.syncStatus)
+        activeRuntimeProfileId = profileId
+        observedIptvFavoritesOnHome = null
+    }
+
+    private fun hasCachedLogo(key: String): Boolean = synchronized(logoCacheLock) {
+        logoCache.containsKey(key)
+    }
+
+    private fun putCachedLogo(key: String, value: String): Boolean {
+        synchronized(logoCacheLock) {
+            val existing = logoCache[key]
+            if (existing == value) return false
+            logoCache[key] = value
+            while (logoCache.size > maxLogoCacheEntries) {
+                val oldestKey = logoCache.entries.iterator().next().key
+                logoCache.remove(oldestKey)
+            }
+            logoCacheRevision += 1L
+            return true
+        }
+    }
+
+    private fun putCachedLogos(entries: Map<String, String>): Boolean {
+        if (entries.isEmpty()) return false
+        var changed = false
+        synchronized(logoCacheLock) {
+            entries.forEach { (key, value) ->
+                if (logoCache[key] != value) {
+                    logoCache[key] = value
+                    changed = true
+                }
+                val parts = key.split("_")
+                if (parts.size >= 2) {
+                    val mediaType = if (parts[0].equals("tv", ignoreCase = true)) MediaType.TV else MediaType.MOVIE
+                    val mediaId = parts[1].toIntOrNull()
+                    if (mediaId != null && value.isNotBlank()) {
+                        mediaRepository.cacheLogoUrl(mediaType, mediaId, value)
+                    }
+                }
+            }
+            if (changed) {
+                while (logoCache.size > maxLogoCacheEntries) {
+                    val oldestKey = logoCache.entries.iterator().next().key
+                    logoCache.remove(oldestKey)
+                }
+                logoCacheRevision += 1L
+            }
+        }
+        if (changed) saveLogoCacheToDisk()
+        return changed
+    }
+
+    private fun snapshotLogoCache(): Map<String, String> = synchronized(logoCacheLock) {
+        LinkedHashMap(logoCache)
+    }
+
+    private fun replaceCardLogoState(snapshot: Map<String, String>) {
+        val keysToRemove = cardLogoUrls.keys.toList().filterNot { snapshot.containsKey(it) }
+        keysToRemove.forEach { cardLogoUrls.remove(it) }
+        snapshot.forEach { (key, value) ->
+            if (cardLogoUrls[key] != value) {
+                cardLogoUrls[key] = value
+            }
+        }
+    }
+
+    private fun publishLogoCacheSnapshotIfChanged() {
+        val snapshot: Map<String, String>
+        synchronized(logoCacheLock) {
+            if (logoCacheRevision == lastPublishedLogoCacheRevision) return
+            snapshot = LinkedHashMap(logoCache)
+            lastPublishedLogoCacheRevision = logoCacheRevision
+        }
+        lastLogoCachePublishMs = SystemClock.elapsedRealtime()
+        replaceCardLogoState(snapshot)
+    }
+
+    private fun scheduleLogoCachePublish(highPriority: Boolean = false) {
+        if (highPriority) {
+            pendingLogoPublishPriority = true
+        }
+        val idleElapsedAtSchedule = System.currentTimeMillis() - lastFocusChangeTime
+        if (highPriority && idleElapsedAtSchedule < LOGO_CACHE_FAST_SCROLL_IDLE_MS) {
+            // During rapid D-pad movement, avoid forcing immediate full-map publishes.
+            pendingLogoPublishPriority = false
+        }
+        if (logoCachePublishJob?.isActive == true) {
+            if (highPriority) {
+                logoCachePublishJob?.cancel()
+            } else {
+                return
+            }
+        }
+        logoCachePublishJob = viewModelScope.launch {
+            val priorityNow = pendingLogoPublishPriority
+            pendingLogoPublishPriority = false
+            if (priorityNow) {
+                val elapsedSincePublish = SystemClock.elapsedRealtime() - lastLogoCachePublishMs
+                val priorityThrottleMs = if (isLowRamDevice) 120L else 80L
+                val throttleWaitMs = (priorityThrottleMs - elapsedSincePublish).coerceAtLeast(0L)
+                val idleElapsedMs = System.currentTimeMillis() - lastFocusChangeTime
+                val idleWaitMs = (LOGO_CACHE_FAST_SCROLL_IDLE_MS - idleElapsedMs).coerceAtLeast(0L)
+                val waitMs = maxOf(throttleWaitMs, idleWaitMs)
+                if (waitMs > 0L) delay(waitMs)
+            } else {
+                while (true) {
+                    val elapsedSincePublish = SystemClock.elapsedRealtime() - lastLogoCachePublishMs
+                    val throttleWaitMs = (LOGO_CACHE_PUBLISH_THROTTLE_MS - elapsedSincePublish).coerceAtLeast(0L)
+                    val idleElapsedMs = System.currentTimeMillis() - lastFocusChangeTime
+                    val idleWaitMs = (LOGO_CACHE_IDLE_REQUIRED_MS - idleElapsedMs).coerceAtLeast(0L)
+                    val waitMs = maxOf(throttleWaitMs, idleWaitMs)
+                    if (waitMs <= 0L) break
+                    delay(waitMs)
+                }
+            }
+            publishLogoCacheSnapshotIfChanged()
+        }
+    }
+
+    /** Restore logo URL cache from disk (SharedPreferences). Called once at init. */
+    private fun restoreLogoCacheFromDisk() {
+        try {
+            val json = logoCachePrefs.getString("urls", null) ?: return
+            if (json.length > maxLogoCacheJsonChars) {
+                logoCachePrefs.edit().remove("urls").apply()
+                return
+            }
+            val map = org.json.JSONObject(json)
+            val keys = map.keys()
+            synchronized(logoCacheLock) {
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    val url = map.getString(key)
+                    logoCache[key] = url
+                    while (logoCache.size > maxLogoCacheEntries) {
+                        val eldestKey = logoCache.entries.iterator().next().key
+                        logoCache.remove(eldestKey)
+                    }
+                    val parts = key.split("_")
+                    if (parts.size >= 2) {
+                        val mediaType = if (parts[0].equals("tv", ignoreCase = true)) MediaType.TV else MediaType.MOVIE
+                        val mediaId = parts[1].toIntOrNull()
+                        if (mediaId != null && !url.isNullOrBlank()) {
+                            mediaRepository.cacheLogoUrl(mediaType, mediaId, url)
+                        }
+                    }
+                }
+                if (logoCache.isNotEmpty()) {
+                    logoCacheRevision += 1L
+                }
+            }
+            System.err.println("HomeVM: restored ${logoCache.size} logo URLs from disk cache")
+        } catch (e: Throwable) {
+            System.err.println("HomeVM: failed to restore logo cache: ${e.message}")
+            runCatching { logoCachePrefs.edit().remove("urls").apply() }
+        }
+    }
+
+    /** Persist logo URL cache to disk (debounced). */
+    private fun saveLogoCacheToDisk() {
+        logoCacheDiskWriteJob?.cancel()
+        logoCacheDiskWriteJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(2_000L) // debounce: wait 2s after last change before writing
+            try {
+                val snapshot = synchronized(logoCacheLock) { LinkedHashMap(logoCache) }
+                val json = org.json.JSONObject(snapshot as Map<*, *>).toString()
+                logoCachePrefs.edit().putString("urls", json).apply()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                AppLogger.e("HomeVM", "failed to save logo cache: ${e.message}", e)
+            }
+        }
+    }
+
+    private fun invalidateContentLanguageCaches() {
+        heroUpdateJob?.cancel()
+        heroDetailsJob?.cancel()
+        prefetchJob?.cancel()
+        heroDetailsCache.clear()
+        heroDetailsFetchInFlight.clear()
+        lastResolvedBaseCategories = emptyList()
+        mediaRepository.clearMediaCache()
+        _uiState.value = _uiState.value.copy(
+            heroOverviewOverride = null,
+            heroTrailerKey = null,
+            isHeroTransitioning = false
+        )
+    }
+
+    init {
+        observeHomeWatchlist()
+        // Rows are published from many places (startup cache, catalog load, next pages, cloud
+        // reloads), always with unmarked cards. Once a pass has run, new rows take over what it
+        // found at once, so the ticks do not blink off while a catalog load lands; before that,
+        // or when the rows are still not the marked ones, a debounced pass runs.
+        viewModelScope.launch {
+            _uiState
+                .map { it.categories }
+                .distinctUntilChanged { old, new -> old === new }
+                .collect { rows ->
+                    if (rows.isEmpty() || rows === lastWatchedBadgesCategories) return@collect
+                    lastWatchedBadgesLookup?.let { (watchedMovies, startedShows) ->
+                        val marked = _uiState.updateAndGet { it.withWatchedBadges(watchedMovies, startedShows) }
+                        lastWatchedBadgesCategories = marked.categories
+                    }
+                    refreshWatchedBadges()
+                }
+        }
+
+        viewModelScope.launch {
+            profileManager.activeProfileId
+                .distinctUntilChanged()
+                .collect { profileId ->
+                    val previousProfileId = activeRuntimeProfileId
+                    if (previousProfileId == null) {
+                        activeRuntimeProfileId = profileId
+                        launchContinueWatchingFetch()
+                        return@collect
+                    }
+                    if (previousProfileId != profileId) {
+                        resetProfileRuntimeState(profileId)
+                        loadHomeData()
+                        launchContinueWatchingFetch()
+                    }
+                }
+        }
+
+        // Switching IPTV playlists or portals on or off must rebuild the Favorite TV row.
+        viewModelScope.launch {
+            iptvRepository.observeConfig()
+                .map(::iptvFavoriteSourceKey)
+                .distinctUntilChanged()
+                .drop(1)
+                .collectLatest { rebuildFavoriteTvAfterSourceChange() }
+        }
+
+        // Keep Home preferences bound to the active profile. Cloud restore and profile
+        // switching can update DataStore after this ViewModel has already been created.
+        viewModelScope.launch {
+            try {
+                observeHomeProfilePreferences(
+                    activeProfileId = profileManager.activeProfileId,
+                    preferences = context.settingsDataStore.data
+                ).collect { preferences ->
+                    val previousState = _uiState.value
+                    val autoplayJustEnabled = !previousState.trailerAutoPlay && preferences.trailerAutoPlay
+                    mediaRepository.contentLanguage = preferences.contentLanguage
+                    val normalizedLanguage = mediaRepository.contentLanguage
+                    val langChanged = observedContentLanguage?.let { it != normalizedLanguage } ?: false
+                    observedContentLanguage = normalizedLanguage
+                    val iptvFavoritesPlacementChanged = observedIptvFavoritesOnHome
+                        ?.let { it != preferences.iptvFavoritesOnHome }
+                        ?: false
+                    observedIptvFavoritesOnHome = preferences.iptvFavoritesOnHome
+
+                    _uiState.value = previousState.copy(
+                        trailerAutoPlay = preferences.trailerAutoPlay,
+                        trailerSoundEnabled = preferences.trailerSoundEnabled,
+                        trailerDelaySeconds = preferences.trailerDelaySeconds,
+                        trailerInCards = preferences.trailerInCards,
+                        netflixHomeStyle = preferences.netflixHomeStyle,
+                        showBudget = preferences.showBudget,
+                        clockFormat = preferences.clockFormat,
+                        smoothScrolling = preferences.smoothScrolling
+                    )
+
+                    if (!preferences.trailerAutoPlay) {
+                        heroTrailerJob?.cancel()
+                        heroTrailerRequestKey = null
+                        _uiState.value = _uiState.value.copy(heroTrailerKey = null)
+                    }
+                    if (langChanged) {
+                        invalidateContentLanguageCaches()
+                        loadHomeData()
+                    } else if (iptvFavoritesPlacementChanged) {
+                        loadHomeData()
+                    } else if (autoplayJustEnabled) {
+                        _uiState.value.heroItem?.let(::hydrateHeroDetailsIfNeeded)
+                    }
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                AppLogger.e("HomeVM", "Failed to observe profile preferences: ${e.message}", e)
+            }
+        }
+
+        // Subscribe to realtime watch_history events so Continue Watching refreshes on
+        // this device within a few seconds of another device updating the shared
+        // Supabase watch_history table. Before this, mid-playback updates from device A
+        // were only visible on device B after a manual Home ON_RESUME or the 5-minute
+        // periodic sync — so switching devices mid-episode always showed the stale
+        // resume position. Fixes #91.
+        viewModelScope.launch {
+            realtimeSyncManager.watchHistoryEvents.collect {
+                // Fast path: directly update the progress bar on existing CW cards using
+                // Supabase watch_history data (which Device A writes every ~5s). This gives
+                // immediate visual feedback without waiting for the full Trakt re-fetch
+                // (which can take 10+ seconds for profiles with hundreds of watched items).
+                runCatching {
+                    val historyEntries = watchHistoryRepository.getContinueWatching()
+                    if (historyEntries.isNotEmpty()) {
+                        val latestCategories = _uiState.value.categories.toMutableList()
+                        val cwIndex = latestCategories.indexOfFirst { it.id == "continue_watching" }
+                        if (cwIndex >= 0) {
+                            val existingCategory = latestCategories[cwIndex]
+                            val sortedHistory = historyEntries.sortedByDescending {
+                                it.updated_at ?: it.paused_at.orEmpty()
+                            }
+                            val updatedItems = existingCategory.items.map { mediaItem ->
+                                val mediaTypeKey = if (mediaItem.mediaType == MediaType.TV) "tv" else "movie"
+                                val itemSeason = mediaItem.nextEpisode?.seasonNumber
+                                val itemEpisode = mediaItem.nextEpisode?.episodeNumber
+                                val exactKey = "$mediaTypeKey:${mediaItem.id}:${itemSeason ?: -1}:${itemEpisode ?: -1}"
+                                val match = sortedHistory.firstOrNull { entry ->
+                                    "${entry.media_type}:${entry.show_tmdb_id}:${entry.season ?: -1}:${entry.episode ?: -1}" == exactKey
+                                }
+                                if (match != null) {
+                                    val storedProgress = (match.progress * 100f).toInt()
+                                    val derivedProgress = if (storedProgress <= 0 && match.duration_seconds > 0 && match.position_seconds > 0) {
+                                        ((match.position_seconds.toFloat() / match.duration_seconds.toFloat()) * 100f).toInt()
+                                    } else {
+                                        storedProgress
+                                    }
+                                    mediaItem.copy(progress = derivedProgress.coerceIn(0, 100))
+                                } else {
+                                    mediaItem
+                                }
+                            }
+                            latestCategories[cwIndex] = existingCategory.copy(items = updatedItems)
+                            _uiState.value = _uiState.value.copy(categories = latestCategories)
+                        }
+                    }
+                }
+                // Full refresh: re-resolve from all sources (Trakt, local, Supabase).
+                // This runs after the fast path so the progress bar updates immediately,
+                // then the authoritative Trakt data (with correct subtitle/resume label)
+                // replaces it when the fetch completes.
+                refreshContinueWatchingOnly(force = true)
+                try {
+                    launcherContinueWatchingRepository.refreshForCurrentProfile()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            // The app came back to the foreground. Another device may have
+            // watched something since, so ask the tracker again rather than
+            // serving the row from the refresh throttle and the repository's
+            // five-minute cache, which is what left an episode watched
+            // elsewhere overnight missing here until something else happened
+            // to clear both windows.
+            appForegroundSignals.returnedToForeground.collect {
+                refreshContinueWatchingOnly(force = true)
+            }
+        }
+
+        viewModelScope.launch {
+            // After a long idle this device pulls the other devices' progress first;
+            // rebuild the row from it once that lands.
+            idleReturnCoordinator.syncCompleted.collect { revision ->
+                if (revision > 0L) refreshContinueWatchingOnly(force = true)
+            }
+        }
+
+        viewModelScope.launch {
+            continueWatchingUpdates.updates.collect { update ->
+                val activeProfileId = profileManager.getProfileIdSync().ifBlank { "default" }
+                if (update.profileId != activeProfileId) return@collect
+
+                val categories = when (update) {
+                    is ContinueWatchingUpdate.Upsert -> {
+                        val item = update.item.toMediaItem(context)
+                        mediaRepository.cacheItem(item)
+                        ContinueWatchingRowReducer.upsert(_uiState.value.categories, item)
+                    }
+                    is ContinueWatchingUpdate.Remove -> ContinueWatchingRowReducer.remove(
+                        categories = _uiState.value.categories,
+                        mediaType = update.mediaType,
+                        tmdbId = update.tmdbId,
+                        season = update.season,
+                        episode = update.episode
+                    )
+                }
+                val continueWatchingItems = categories
+                    .firstOrNull { it.id == "continue_watching" }
+                    ?.items
+                    .orEmpty()
+                lastContinueWatchingItems = continueWatchingItems
+                lastContinueWatchingUpdateMs = SystemClock.elapsedRealtime()
+                _uiState.value = _uiState.value.copy(categories = categories)
+            }
+        }
+
+        // Reload home data when account_sync changes arrive from another device
+        // (catalogs, addons, settings pushed by TV/phone). This ensures the UI
+        // reflects the latest state without waiting for the next ON_RESUME.
+        viewModelScope.launch {
+            realtimeSyncManager.accountSyncEvents.collect {
+                loadHomeData()
+                try {
+                    launcherContinueWatchingRepository.refreshForCurrentProfile()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                }
+            }
+        }
+
+        // Collect sync status so the UI can show a connection indicator.
+        viewModelScope.launch {
+            realtimeSyncManager.syncStatusFlow.collect { status ->
+                _uiState.value = _uiState.value.copy(syncStatus = status)
+            }
+        }
+        // Restore logo URL cache from disk off the main thread. This used to run
+        // synchronously during HomeViewModel init, which made the profile->home
+        // transition much more likely to hitch or ANR on phones with larger caches.
+        viewModelScope.launch(Dispatchers.IO) {
+            restoreLogoCacheFromDisk()
+            val cachedLogos = snapshotLogoCache()
+            if (cachedLogos.isNotEmpty()) {
+                withContext(Dispatchers.Main) {
+                    replaceCardLogoState(cachedLogos)
+                }
+                // Keep startup smooth: defer memory warmup until after initial Home rendering.
+                delay(if (isLowRamDevice) 1_800L else 1_200L)
+                val cachedUrls = synchronized(logoCacheLock) { logoCache.values.toList() }
+                preloadLogoImages(
+                    cachedUrls.takeLast(if (isLowRamDevice) 8 else 12),
+                    batchLimit = if (isLowRamDevice) 4 else 6
+                )
+            }
+        }
+
+        // Instantly show last session's home categories from disk cache so the home
+        // screen appears populated within 1 frame of launch — no skeleton loading
+        // phase. loadHomeData() refreshes from TMDB in the background and silently
+        // replaces the cached data when it arrives.
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                applyContentLanguageFromPrefs()
+                // Mobile Home keeps these rows when the network load starts, so a catalog removed
+                // after the cache was written must not come back from it. TV rebuilds its rows
+                // from the saved catalogs on every load and is left as it was.
+                val cachedCategories = loadCategoriesCache().let { cached ->
+                    if (isTvDevice || cached.isEmpty()) cached
+                    else dropCategoriesMissingFromSavedCatalogs(
+                        cached,
+                        runCatching { catalogRepository.getCatalogs() }.getOrNull()
+                    )
+                }
+                // Gate on "no real BASE rows yet", not "no categories at all": Continue Watching
+                // is restored from its own cache by a coroutine launched alongside this one, and
+                // whichever finishes first used to decide the outcome. When CW won, it put a row
+                // into `categories`, the isEmpty() guard failed, and every cached base row was
+                // dropped — leaving the screen empty until the network load finished ~5s later.
+                // That race is what made the slow home load intermittent.
+                if (cachedCategories.isNotEmpty() && !hasRealBaseCategories()) {
+                    val cachedHero = chooseInitialHero(cachedCategories)
+                    val cachedHeroKey = cachedHero?.let { "${it.mediaType}_${it.id}" }
+                    val cachedHeroLogo = cachedHeroKey?.let { getCachedLogo(it) }
+                    withContext(Dispatchers.Main) {
+                        if (!hasRealBaseCategories()) {
+                            // A Continue Watching row already on screen is fresher than the one in
+                            // this cache — keep it, and take only the base rows from disk.
+                            val liveCw = _uiState.value.categories
+                                .firstOrNull { it.id == "continue_watching" }
+                            val merged = if (liveCw != null) {
+                                listOf(liveCw) + cachedCategories.filterNot { it.id == "continue_watching" }
+                            } else {
+                                cachedCategories
+                            }
+                            // Don't stomp a hero the Continue Watching path already set — and take
+                            // the logo from whichever hero wins, so a live hero can never be shown
+                            // with the cached hero's logo.
+                            val liveHero = _uiState.value.heroItem
+                            val finalHero = liveHero ?: cachedHero
+                            val finalLogo = if (liveHero != null) {
+                                _uiState.value.heroLogoUrl
+                                    ?: getCachedLogo("${liveHero.mediaType}_${liveHero.id}")
+                            } else {
+                                cachedHeroLogo
+                            }
+                            _uiState.value = _uiState.value.copy(
+                                isLoading = false,
+                                isInitialLoad = false,
+                                categories = merged,
+                                heroItem = finalHero,
+                                heroLogoUrl = finalLogo,
+                                error = null
+                            )
+                        }
+                    }
+                }
+                    } catch (e: Exception) {
+                if (e is CancellationException) throw e
+            }
+        }
+
+        // Instantly show Continue Watching from disk cache before anything else loads.
+        // When Trakt is connected, we still use the cache for instant display but the
+        // cache will only contain Trakt-sourced items after the first successful
+        // resolveContinueWatchingItems call (which saves Trakt-only data to the cache).
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val dismissedKeys = runCatching {
+                    traktRepository.getDismissedContinueWatchingShowKeys()
+                }.getOrDefault(emptySet())
+                val cached = preloadStartupContinueWatchingItems().filterNot { item ->
+                    dismissedKeys.contains("${item.mediaType.name}:${item.id}")
+                }
+                if (cached.isNotEmpty()) {
+                    val merged = cached
+                    val cwCategory = Category(
+                        id = "continue_watching",
+                        title = "Continue Watching",
+                        items = merged.map { it.toMediaItem() }
+                    )
+                    cwCategory.items.forEach { mediaRepository.cacheItem(it) }
+
+                    // Set hero item IMMEDIATELY from raw CW data (before the slow
+                    // merge step) so the hero section, clear logo, and overview text
+                    // appear on the very first frame after profile selection.
+                    val rawFirstItem = cached.firstOrNull()?.toMediaItem()
+                    val heroKey = rawFirstItem?.let { "${it.mediaType}_${it.id}" }
+                    val heroLogo = heroKey?.let { getCachedLogo(it) }
+
+                    withContext(Dispatchers.Main) {
+                        if (rawFirstItem != null && _uiState.value.heroItem == null) {
+                            if (heroLogo != null) {
+                                if (isStartupSettling()) {
+                                    scheduleStartupImageWarmup(logoUrls = listOf(heroLogo))
+                                } else {
+                                    preloadLogoImages(listOf(heroLogo), batchLimit = 1)
+                                }
+                            }
+                            mediaRepository.cacheItem(rawFirstItem)
+                            _uiState.value = _uiState.value.copy(
+                                heroItem = rawFirstItem,
+                                heroLogoUrl = heroLogo
+                            )
+                            if (isStartupSettling()) {
+                                scheduleStartupHeroHydration(rawFirstItem)
+                            } else {
+                                hydrateHeroDetailsIfNeeded(rawFirstItem)
+                            }
+                        }
+
+                        lastContinueWatchingItems = cwCategory.items
+                        lastContinueWatchingUpdateMs = SystemClock.elapsedRealtime()
+                        val updated = _uiState.value.categories.toMutableList()
+                        val idx = updated.indexOfFirst { it.id == "continue_watching" }
+                        if (idx >= 0) updated[idx] = cwCategory else updated.add(0, cwCategory)
+                        _uiState.value = _uiState.value.copy(
+                            categories = updated
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                AppLogger.e("HomeVM", "preload CW cache failed: ${e.message}", e)
+            }
+        }
+        scheduleInitialHomeLoad()
+        // Defer heavy background warmups so first-launch navigation remains smooth.
+        viewModelScope.launch {
+            delay(if (isLowRamDevice) 10 * 60_000L else 8 * 60_000L)
+            kotlinx.coroutines.withContext(Dispatchers.IO) {
+                try {
+                    iptvRepository.warmVodCachesIfPossible()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    AppLogger.e("HomeVM", "warmVodCachesIfPossible failed", e)
+                }
+            }
+        }
+        viewModelScope.launch {
+            observeHomeTrackingState(profileManager.activeProfileId,
+                context.settingsDataStore.data, context.traktDataStore.data)
+                .drop(1).collect {
+                    homeTrackingRevision += 1L
+                    refreshContinueWatchingOnly(force = true)
+                }
+        }
+        viewModelScope.launch {
+            traktSyncService.syncEvents.collect { status ->
+                if (status == com.arflix.tv.data.repository.SyncStatus.COMPLETED) {
+                    refreshContinueWatchingOnly(force = true)
+                }
+            }
+        }
+        viewModelScope.launch {
+            // COMPLETED goes out before the watched cache is reloaded, so the ticks follow the
+            // reload itself - otherwise a fresh Trakt connection shows its ticks only after restart.
+            traktRepository.watchedCacheReloaded.collect { refreshWatchedBadges(immediate = true) }
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            delay(if (isLowRamDevice) 8 * 60_000L else 6 * 60_000L)
+            // Warm IPTV channels + EPG in background after startup settles.
+            // First load from disk cache (fast), then do targeted network EPG refresh
+            // for favorite channels so home screen shows current program info.
+            try {
+                iptvRepository.prefetchFreshStartupData()
+                val snapshot = iptvRepository.getMemoryCachedSnapshot() ?: return@launch
+                // Phase 2: Refresh EPG for favorite channels (lightweight network call)
+                val snap = iptvRepository.getMemoryCachedSnapshot()
+                if (snap != null) {
+                    val favIds = snap.favoriteChannels.toHashSet()
+                    val favChannelIds = snap.channels
+                        .filter { favIds.contains(it.id) }
+                        .map { it.id }
+                        .toSet()
+                    if (favChannelIds.isNotEmpty()) {
+                        refreshFavoriteTvEpg(networkFetch = false)
+                    }
+                }
+                    } catch (e: Exception) {
+                if (e is CancellationException) throw e
+            }
+        }
+        viewModelScope.launch {
+            catalogRepository.observeCatalogs()
+                .distinctUntilChanged()
+                .drop(1) // Initial state is already loaded; do not discard the first user update.
+                .collect {
+                    // Apply catalog reorder/add/remove immediately on Home.
+                    loadHomeData()
+                }
+        }
+
+        viewModelScope.launch {
+            var previousStatus: com.arflix.tv.updater.UpdateStatus = com.arflix.tv.updater.UpdateStatus.Idle
+            updateStatusManager.status.collect { status ->
+                val hasBadge = status is com.arflix.tv.updater.UpdateStatus.UpdateAvailable || status is com.arflix.tv.updater.UpdateStatus.ReadyToInstall || status is com.arflix.tv.updater.UpdateStatus.Downloading
+
+                var shouldAutoOpen = false
+                var isIgnored = false
+                if (status is com.arflix.tv.updater.UpdateStatus.UpdateAvailable) {
+                    val persistedIgnoredTag = updatePreferences.ignoredTag.first()
+                    if (persistedIgnoredTag == status.update.tag || updateStatusManager.sessionIgnoredTag == status.update.tag) {
+                        isIgnored = true
+                    }
+                }
+
+                // Auto-open only when we first discover a new unignored update. In quiet mode a
+                // small notice replaces the popup; the update stays available in Settings.
+                var quietNotice: String? = null
+                if (status is com.arflix.tv.updater.UpdateStatus.UpdateAvailable && previousStatus !is com.arflix.tv.updater.UpdateStatus.UpdateAvailable && !isIgnored) {
+                    if (updatePreferences.quietNotifications.first()) {
+                        if (!quietUpdateNoticeShown) {
+                            quietUpdateNoticeShown = true
+                            quietNotice = context.getString(
+                                R.string.home_update_available_quiet,
+                                status.update.title.ifBlank { status.update.tag }
+                            )
+                        }
+                    } else {
+                        shouldAutoOpen = true
+                    }
+                }
+                if (quietNotice != null) _quietUpdateNotice.value = quietNotice
+
+                _uiState.value = _uiState.value.copy(
+                    updateStatus = status,
+                    showAppUpdateDialog = if (shouldAutoOpen) true else _uiState.value.showAppUpdateDialog,
+                    hasUpdateBadge = hasBadge && !isIgnored
+                )
+
+                previousStatus = status
+            }
+        }
+
+        // Check for updates shortly after startup
+        viewModelScope.launch {
+            delay(if (isLowRamDevice) 15_000L else 10_000L)
+            checkForAppUpdates(silent = true)
+        }
+
+    }
+
+    /**
+     * Set preloaded data from StartupViewModel for instant display.
+     * This skips the initial network call since data is already loaded.
+     *
+     * Shows placeholder Continue Watching cards immediately while real data loads.
+     */
+    fun setPreloadedData(
+        categories: List<Category>,
+        heroItem: MediaItem?,
+        heroLogoUrl: String?,
+        logoCache: Map<String, String>
+    ) {
+
+        if (usedPreloadedData) {
+            if (logoCache.isNotEmpty()) {
+                if (putCachedLogos(logoCache)) {
+                    publishLogoCacheSnapshotIfChanged()
+                }
+            }
+            _uiState.update { it.withBackgroundHero(heroItem, heroLogoUrl) }
+            return
+        }
+        if (categories.isEmpty()) {
+            return
+        }
+
+        usedPreloadedData = true
+
+        categories.forEach { cat -> cat.items.forEach { mediaRepository.cacheItem(it) } }
+        heroItem?.let { mediaRepository.cacheItem(it) }
+        putCachedLogos(logoCache)
+        resolveIptvChannels(categories.flatMap { it.items })
+
+        val filteredCategories = preloadedHomeCategories(categories, _uiState.value.categories)
+
+        // Adjust hero item if it was from continue watching
+        val adjustedHeroItem = if (heroItem != null &&
+            categories.firstOrNull()?.id == "continue_watching" &&
+            categories.firstOrNull()?.items?.any { it.id == heroItem.id } == true) {
+            // Hero was from continue watching, use first item from filtered categories
+            filteredCategories.getOrNull(1)?.items?.firstOrNull() ?: heroItem
+        } else if (heroItem != null && !isCollectionItem(heroItem)) {
+            heroItem
+        } else {
+            chooseInitialHero(filteredCategories)
+        }
+
+        // Startup data must not replace an already selected hero, even without a logo.
+        val currentHero = _uiState.value.heroItem
+        val currentLogo = _uiState.value.heroLogoUrl
+        val finalHero = if (currentHero != null) {
+            currentHero
+        } else {
+            adjustedHeroItem
+        }
+        val finalLogo = if (finalHero == currentHero) {
+            currentLogo  // keep the cached logo
+        } else if (adjustedHeroItem == heroItem) {
+            heroLogoUrl  // use whatever startup preloaded
+        } else {
+            null
+        }
+        _uiState.value = _uiState.value.copy(
+            isLoading = false,
+            isInitialLoad = false,
+            categories = filteredCategories,
+            heroItem = finalHero,
+            heroLogoUrl = finalLogo,
+            error = null
+        )
+        replaceCardLogoState(snapshotLogoCache())
+        refreshWatchedBadges()
+    }
+
+    private val prefetchedDetailsKeys = Collections.synchronizedSet(mutableSetOf<String>())
+    private val collectionCatalogByMediaId = ConcurrentHashMap<Int, CatalogConfig>()
+
+    fun getCollectionCatalog(item: MediaItem): CatalogConfig? {
+        return collectionCatalogByMediaId[item.id]
+    }
+
+    private val collectionTitleResById: Map<String, Int> = mapOf(
+        "Featured" to R.string.featured,
+        "Services" to R.string.services,
+        "Genres" to R.string.genres,
+        "Decades" to R.string.decades,
+        "Franchises" to R.string.franchises,
+        "Networks" to R.string.networks,
+        "Latest Movies" to R.string.collections_latest_movies,
+        "Latest Shows" to R.string.collections_latest_shows,
+        "Trending Movies" to R.string.trending_movies,
+        "Trending Shows" to R.string.trending_in_shows,
+        "Action" to R.string.collections_genre_action,
+        "Comedy" to R.string.collections_genre_comedy,
+        "Sci-Fi" to R.string.collections_genre_sci_fi,
+        "Thriller" to R.string.collections_genre_thriller,
+        "Drama" to R.string.collections_genre_drama,
+        "Horror" to R.string.collections_genre_horror,
+        "Documentary" to R.string.collections_genre_documentary,
+        "Romance" to R.string.collections_genre_romance,
+        "Animation" to R.string.collections_genre_animation,
+        "Family" to R.string.collections_genre_family,
+        "Fantasy" to R.string.collections_genre_fantasy,
+        "Adventure" to R.string.collections_genre_adventure,
+        "Superhero" to R.string.collections_genre_superhero,
+        "War & Military" to R.string.collections_genre_war_military,
+        "20's Movies" to R.string.collections_decade_20s,
+        "10's Movies" to R.string.collections_decade_10s,
+        "00's Movies" to R.string.collections_decade_00s,
+        "90's Movies" to R.string.collections_decade_90s,
+        "80's Movies" to R.string.collections_decade_80s,
+        "70's Movies" to R.string.collections_decade_70s,
+        "60's Movies" to R.string.collections_decade_60s,
+    )
+
+    /** Display-only localization of preinstalled collection/rail titles. The persisted
+     *  CatalogConfig keeps the English title (used for matching/dedup); only the
+     *  ephemeral Category/MediaItem shown on the home screen is translated. */
+    private fun localizedCollectionTitle(title: String): String =
+        collectionTitleResById[title]?.let { context.getString(it) } ?: title
+
+    private fun toCollectionCategory(row: HomeCollectionRow): Category {
+        val items = row.items.mapIndexed { index, config ->
+            val fakeId = (config.id.hashCode() and Int.MAX_VALUE).let { if (it == 0) index + 1 else it }
+            collectionCatalogByMediaId[fakeId] = config
+            // Cards intentionally do NOT seed a clearlogo or a description
+            // for collection tiles — the branded cover is the whole card,
+            // per the design spec. Clearlogo lives only on the collection
+            // detail hero; description lives only on detail, never on
+            // the home-row card.
+            MediaItem(
+                id = fakeId,
+                title = localizedCollectionTitle(config.title),
+                overview = "",
+                mediaType = MediaType.MOVIE,
+                image = config.collectionCoverImageUrl.orEmpty(),
+                backdrop = config.collectionFocusGifUrl
+                    ?: config.collectionHeroImageUrl
+                    ?: config.collectionCoverImageUrl,
+                status = "collection:${config.id}",
+                collectionGroup = config.collectionGroup,
+                collectionTileShape = config.collectionTileShape,
+                collectionHideTitle = config.collectionHideTitle
+            )
+        }
+        return Category(
+            id = row.id,
+            title = localizedCollectionTitle(row.title),
+            items = items
+        )
+    }
+
+    /**
+     * Fetch Continue Watching in its OWN coroutine that is NOT cancelled by
+     * loadHomeData restarts. loadHomeData() is called multiple times during
+     * startup (profile load, catalog observer, cloud pull), each cancelling
+     * the previous job. When getContinueWatching() was inside that job, the
+     * 30-60s Trakt fetch (all watched shows × progress API) was always getting
+     * cancelled before completing. This decoupled coroutine survives those
+     * restarts and updates the CW row independently when the data arrives.
+     */
+    private fun launchContinueWatchingFetch() {
+        val ticket = continueWatchingRequests.claim(force = false) ?: return
+        cwFetchJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+            val localUpdateRevision = continueWatchingUpdates.revision
+            val trackingRevision = homeTrackingRevision
+            val cached = try {
+                preloadStartupContinueWatchingItems()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (error: Exception) {
+                AppLogger.recordException(
+                    throwable = error,
+                    context = mapOf(
+                        "error_area" to "ContinueWatching",
+                        "cw_phase" to "preload_startup"
+                    )
+                )
+                emptyList()
+            }
+            if (cached.isNotEmpty() && continueWatchingUpdates.revision == localUpdateRevision &&
+                trackingRevision == homeTrackingRevision) {
+                publishContinueWatching(cached)
+            }
+
+            // FAST PATH — resolve from cached Trakt/local data and publish
+            // immediately. Avoids the 30–60s cold-refresh wait that used to
+            // leave the CW row empty for minutes (especially when the Trakt
+            // progress endpoint throttles with HTTP 429).
+            val instant = try {
+                resolveContinueWatchingItemsStable(forceFresh = false)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (error: Exception) {
+                AppLogger.recordException(
+                    throwable = error,
+                    context = mapOf(
+                        "error_area" to "ContinueWatching",
+                        "cw_phase" to "instant"
+                    )
+                )
+                null
+            }
+            if (instant != null && continueWatchingUpdates.revision == localUpdateRevision &&
+                trackingRevision == homeTrackingRevision) {
+                publishContinueWatching(instant)
+            }
+
+            // SLOW PATH — do a freshness refresh in the background. If it
+            // returns something different, republish. Swallows transient
+            // Trakt 429s so the visible row doesn't blink back to empty.
+            val fresh = try {
+                resolveContinueWatchingItemsStable(forceFresh = true)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (error: Exception) {
+                AppLogger.recordException(
+                    throwable = error,
+                    context = mapOf(
+                        "error_area" to "ContinueWatching",
+                        "cw_phase" to "fresh"
+                    )
+                )
+                null
+            }
+            if (
+                fresh != null &&
+                fresh != instant &&
+                continueWatchingUpdates.revision == localUpdateRevision && trackingRevision == homeTrackingRevision
+            ) {
+                publishContinueWatching(fresh)
+            }
+            val traktConnected = try {
+            traktRepository.hasTrakt()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            false
+        }
+            if (traktConnected && cached.isEmpty() && instant?.isEmpty() == true && fresh?.isEmpty() == true) {
+                AppLogger.breadcrumb(
+                    tag = "ContinueWatching",
+                    message = "trakt_connected_empty_all_paths",
+                    severity = "warning"
+                )
+            }
+            } finally {
+                if (continueWatchingRequests.finish(ticket) && isActive) {
+                    withContext(Dispatchers.Main.immediate) { refreshContinueWatchingOnly(force = true) }
+                }
+            }
+        }
+    }
+
+    private suspend fun publishContinueWatching(items: List<ContinueWatchingItem>) {
+        if (items.isEmpty()) {
+            withContext(Dispatchers.IO) {
+                persistContinueWatchingCache(emptyList())
+            }
+            withContext(Dispatchers.Main) {
+                lastContinueWatchingItems = emptyList()
+                lastContinueWatchingUpdateMs = SystemClock.elapsedRealtime()
+                val current = _uiState.value.categories.filterNot { it.id == "continue_watching" }
+                if (current.size != _uiState.value.categories.size) {
+                    _uiState.value = _uiState.value.copy(categories = current)
+                }
+            }
+            return
+        }
+        withContext(Dispatchers.IO) {
+            persistContinueWatchingCache(items)
+        }
+        val continueWatchingCategory = Category(
+            id = "continue_watching",
+            title = "Continue Watching",
+            items = items.map { it.toMediaItem() }
+        )
+        continueWatchingCategory.items.forEach { mediaRepository.cacheItem(it) }
+        lastContinueWatchingItems = continueWatchingCategory.items
+        lastContinueWatchingUpdateMs = SystemClock.elapsedRealtime()
+        withContext(Dispatchers.Main) {
+            val current = _uiState.value.categories.toMutableList()
+            val cwIdx = current.indexOfFirst { it.id == "continue_watching" }
+            if (cwIdx >= 0) {
+                current[cwIdx] = continueWatchingCategory
+            } else {
+                current.add(0, continueWatchingCategory)
+            }
+            _uiState.value = _uiState.value.copy(categories = current)
+        }
+    }
+
+    /**
+     * True when a base (non-Continue-Watching, non-collection) row already holds real content.
+     * Mirrors the test [loadHomeData] uses to decide whether the skeleton is still needed.
+     */
+    private fun hasRealBaseCategories(): Boolean =
+        _uiState.value.categories.any { category ->
+            category.id != "continue_watching" &&
+                !category.id.startsWith("collection_row_") &&
+                category.items.any { !it.isPlaceholder }
+        }
+
+    private fun markHomeDataLoadSuccessful(requestId: Long) {
+        if (requestId == loadHomeRequestId) {
+            lastHomeDataLoadAtMs = SystemClock.elapsedRealtime()
+        }
+    }
+
+    private fun loadHomeData() {
+        loadHomeJob?.cancel()
+        homeDataLoadAttempted = true
+        val requestId = ++loadHomeRequestId
+        loadHomeJob = viewModelScope.launch loadHome@{
+            // Skip delay - preloading now happens on profile focus for instant display
+            // Only add minimal delay if no preloaded data exists yet
+            if (!usedPreloadedData) {
+                delay(50) // Minimal delay for LaunchedEffect to potentially set preloaded data
+            }
+            if (requestId != loadHomeRequestId) return@loadHome
+            applyContentLanguageFromPrefs()
+
+            try {
+                val existingCw = _uiState.value.categories.firstOrNull { it.id == "continue_watching" && it.items.isNotEmpty() }
+                val hasRealBaseCategories = _uiState.value.categories.any {
+                    it.id != "continue_watching" && !it.id.startsWith("collection_row_") && it.items.any { item -> !item.isPlaceholder }
+                }
+                if (!hasRealBaseCategories) {
+                    // Build the early skeleton from the default catalog list minus any
+                    // preinstalled catalogs the user has explicitly hidden for the active
+                    // profile. Without this filter, deleted catalogs flash back into view
+                    // for 1-3 seconds on every cold load and on every loadHomeData() call,
+                    // which is the "catalog reappears after deletion" symptom reported in
+                    // issue #71 (and the duplicate #74 which we already closed).
+                    val hiddenForSkeleton = runCatching {
+                        catalogRepository.getHiddenPreinstalledCatalogIdsForActiveProfile().toSet()
+                    }.getOrDefault(emptySet())
+                    val skeletonDefaults = mediaRepository.getDefaultCatalogConfigs()
+                        .filterNot { cfg -> cfg.isPreinstalled && cfg.id in hiddenForSkeleton }
+                    val earlyHasRemote = runCatching {
+                        traktRepository.hasTrakt() || traktRepository.isAlternativeRemoteActive()
+                    }.getOrDefault(false)
+                    val earlySkeleton = buildProfileSkeletonCategories(
+                        savedCatalogs = skeletonDefaults,
+                        cachedContinueWatching = emptyList(),
+                        hasRemoteContinueWatching = earlyHasRemote
+                    )
+                    val initialSkeleton = if (existingCw != null) {
+                        listOf(existingCw) + earlySkeleton.filterNot { it.id == "continue_watching" }
+                    } else {
+                        earlySkeleton
+                    }
+                    if (requestId != loadHomeRequestId) return@loadHome
+                    if (initialSkeleton.isNotEmpty()) {
+                        _uiState.value = _uiState.value.copy(
+                            isLoading = true,
+                            isInitialLoad = false,
+                            categories = initialSkeleton,
+                            heroItem = _uiState.value.heroItem ?: initialSkeleton.firstOrNull()?.items?.firstOrNull { !it.isPlaceholder },
+                            heroLogoUrl = _uiState.value.heroLogoUrl,
+                            error = null
+                        )
+                    }
+                }
+
+                val cachedContinueWatching = preloadStartupContinueWatchingItems()
+                val rawSavedCatalogs = withContext(networkDispatcher) {
+                    try {
+                        streamRepository.removeCustomAddonsByUrl(
+                            CollectionTemplateManifest.autoInstalledAddonUrls() +
+                                listOf(MediaRepository.STREAMING_COLLECTION_ADDON_URL)
+                        )
+                        // Keep Home usable during upgrades. Each manifest has its own timeout;
+                        // a slow addon must not cancel the whole refresh or starve healthy ones.
+                        viewModelScope.launch(Dispatchers.IO) {
+                            val report = runCatching { streamRepository.refreshInstalledAddonsIfNeeded() }.getOrNull()
+                            if (report != null && report.refreshed > 0) {
+                                val changed = runCatching {
+                                    catalogRepository.syncAddonCatalogs(streamRepository.installedAddons.first())
+                                }.getOrDefault(false)
+                                if (changed) {
+                                    loadHomeData()
+                                }
+                            }
+                        }
+                        val addons = streamRepository.installedAddons.first()
+                        catalogRepository.syncAddonCatalogs(addons)
+                        catalogRepository.syncHomeServerCatalogs(homeServerRepository.getCatalogCandidates())
+                        // Ensure built-in preinstalled catalogs exist, then re-read
+                        // the persisted catalog list so the returned value includes
+                        // BOTH built-ins AND the addon catalogs just synced above.
+                        // Previously `ensurePreinstalledDefaults()` was returned
+                        // directly, and its output didn't include newly-synced
+                        // addon catalogs — that's why user-added Stremio addons
+                        // (Bharat Binge, AIO Metadata, etc.) appeared in the
+                        // Catalogs tab but were dropped from the Home screen.
+                        catalogRepository.ensurePreinstalledDefaults(
+                            mediaRepository.getDefaultCatalogConfigs()
+                        )
+                        catalogRepository.getCatalogs()
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        // If sync/defaults fail, fall back to whatever is already saved
+                        // (includes user's custom Trakt catalogs) instead of only preinstalled defaults.
+                        try {
+                            catalogRepository.getCatalogs()
+                        } catch (e2: Exception) {
+                            if (e2 is CancellationException) throw e2
+                            mediaRepository.getDefaultCatalogConfigs()
+                        }
+                    }
+                }
+                val iptvFavoritesOnHome = isIptvFavoritesOnHomeEnabled()
+                val savedCatalogs = applyIptvFavoritesPlacement(rawSavedCatalogs, iptvFavoritesOnHome)
+                currentSavedCatalogs = savedCatalogs
+                savedCatalogById.clear()
+                savedCatalogs.forEach { savedCatalogById[it.id] = it }
+                categoryPaginationStates.clear()
+
+                val hasRemoteContinueWatching = runCatching {
+                    traktRepository.hasTrakt() || traktRepository.isAlternativeRemoteActive()
+                }.getOrDefault(false)
+
+                if (!isTvDevice) {
+                    loadMobileHomeDataProgressive(requestId, savedCatalogs, cachedContinueWatching, hasRemoteContinueWatching)
+                    return@loadHome
+                }
+
+                // When Home is opened from profile selection, avoid an empty frame by showing
+                // profile-ordered skeleton rows immediately while real catalogs load.
+                if (_uiState.value.categories.isEmpty()) {
+                    val skeletonCategories = buildProfileSkeletonCategories(
+                        savedCatalogs = savedCatalogs,
+                        cachedContinueWatching = cachedContinueWatching,
+                        hasRemoteContinueWatching = hasRemoteContinueWatching
+                    )
+                    if (requestId != loadHomeRequestId) return@loadHome
+                    if (skeletonCategories.isNotEmpty()) {
+                        val skeletonHero = chooseInitialHero(skeletonCategories)
+                        _uiState.value = _uiState.value.copy(
+                            isLoading = true,
+                            isInitialLoad = false,
+                            categories = skeletonCategories,
+                            heroItem = skeletonHero,
+                            heroLogoUrl = null,
+                            error = null
+                        )
+                    }
+                } else {
+                    // Keep preloaded/previous UI visible and refresh in background.
+                    _uiState.value = _uiState.value.copy(isLoading = false, error = null)
+                }
+
+                val currentBaseCategories = _uiState.value.categories.filter {
+                    it.id != "continue_watching" && !it.id.startsWith("collection_row_")
+                }
+                // Build Favorite TV category from IPTV cache (runs on IO)
+                val favoriteTvOutcome = withContext(Dispatchers.IO) {
+                    runCatching { buildFavoriteTvOutcome() }
+                        .getOrDefault(FavoriteTvOutcome.Unavailable)
+                }
+
+                var loadedFreshCatalogRows = false
+                var categories = withContext(networkDispatcher) {
+                    val customCatalogConfigs = savedCatalogs.filter { isCustomCatalogConfig(it) }
+                    val customSemaphore = Semaphore(if (isLowRamDevice) 1 else 2)
+                    val customJobs = customCatalogConfigs.map { cfg ->
+                        async {
+                            customSemaphore.withPermit {
+                                try {
+                                    val result = mediaRepository.loadCustomCatalogPage(cfg, 0, catalogInitialLimit(cfg))
+                                    if (result.items.isEmpty()) return@withPermit null
+                                    val category = Category(cfg.id, cfg.title, result.items).withTop10CapIfNeeded()
+                                    withContext(Dispatchers.Main.immediate) {
+                                        if (requestId == loadHomeRequestId) {
+                                            updateMobileCategoryRow(cfg.id, category,
+                                                hasMore = result.hasMore && !isHardCappedTop10Catalog(cfg.id),
+                                                nextOffset = result.nextOffset)
+                                        }
+                                    }
+                                    category
+                                } catch (e: Exception) {
+                                    if (e is CancellationException) throw e
+                                    null
+                                }
+                            }
+                        }
+                    }
+                    val baseCategories = runCatching {
+                        mediaRepository.getHomeCategories()
+                    }.getOrElse { emptyList() }
+                    loadedFreshCatalogRows = baseCategories.any { hasRealItems(it) }
+
+                    val baseById = LinkedHashMap<String, Category>().apply {
+                        currentBaseCategories.forEach { put(it.id, it) }
+                        baseCategories.forEach { put(it.id, it) }
+                        _sportsHomeRows.value.forEach { put(it.id, it) }
+                        // Inject Favorite TV so catalog ordering picks it up, or remove
+                        // stale skeleton/placeholder if no favorites exist for this profile.
+                        // Unavailable means the IPTV cache simply was not hydrated on this
+                        // pass: keep whatever currentBaseCategories already seeded above so
+                        // a transient cache miss cannot delete a row that is on screen.
+                        when (favoriteTvOutcome) {
+                            is FavoriteTvOutcome.Available ->
+                                put(FAVORITE_TV_CATEGORY_ID, favoriteTvOutcome.category)
+                            FavoriteTvOutcome.Empty -> remove(FAVORITE_TV_CATEGORY_ID)
+                            FavoriteTvOutcome.Unavailable -> Unit
+                        }
+                    }
+
+                    // Split preinstalled into TMDB-based and MDBList-based
+                    val tmdbPreinstalled = savedCatalogs
+                        .filter {
+                            it.isPreinstalled &&
+                                it.sourceUrl.isNullOrBlank() &&
+                                !isCollectionRailConfig(it) &&
+                                !isCollectionTileConfig(it)
+                        }
+                        .mapNotNull { cfg ->
+                            val category = baseById[cfg.id] ?: return@mapNotNull null
+                            if (cfg.title.isNotBlank() && cfg.title != category.title) {
+                                category.copy(title = cfg.title)
+                            } else {
+                                category
+                            }
+                        }
+                    // Publish the built-in rows as soon as TMDB responds. Addon,
+                    // MDBList, home-server and logo enrichment may take longer, but
+                    // they must not hold Trending/Continue Watching in skeleton state.
+                    if (tmdbPreinstalled.isNotEmpty()) {
+                        val earlyCategories = tmdbPreinstalled.toMutableList()
+                        val existingContinueWatching = _uiState.value.categories.firstOrNull { category ->
+                            category.id == "continue_watching" &&
+                                category.items.isNotEmpty() &&
+                                category.items.none { it.isPlaceholder }
+                        }
+                        when {
+                            existingContinueWatching != null -> earlyCategories.add(0, existingContinueWatching)
+                            cachedContinueWatching.isNotEmpty() -> earlyCategories.add(
+                                0,
+                                Category(
+                                    id = "continue_watching",
+                                    title = "Continue Watching",
+                                    items = cachedContinueWatching.map { it.toMediaItem() }
+                                )
+                            )
+                        }
+                        val earlyHero = chooseInitialHero(earlyCategories)
+                        withContext(Dispatchers.Main.immediate) {
+                            if (requestId == loadHomeRequestId) {
+                                _uiState.value = _uiState.value.copy(
+                                    isLoading = false,
+                                    isInitialLoad = false,
+                                    categories = orderCategoriesBySavedCatalogs(
+                                        _uiState.value.categories.filter { current -> earlyCategories.none { it.id == current.id } } + earlyCategories,
+                                        savedCatalogs
+                                    ),
+                                    heroItem = _uiState.value.heroItem ?: earlyHero,
+                                    error = null
+                                )
+                            }
+                        }
+                    }
+                    // Load MDBList preinstalled catalogs - first 8 immediately, rest lazily on scroll
+                    val mdblistConfigs = savedCatalogs.filter {
+                        it.isPreinstalled &&
+                            !it.sourceUrl.isNullOrBlank() &&
+                            !isCollectionRailConfig(it) &&
+                            !isCollectionTileConfig(it)
+                    }
+                    val initialBatch = mdblistConfigs.take(initialMdblistCatalogCount)
+                    val deferredBatch = mdblistConfigs.drop(initialBatch.size)
+                    val mdblistInitial = initialBatch.map { cfg ->
+                        async(networkDispatcher) {
+                            try {
+                                val result = mediaRepository.loadCustomCatalogPage(
+                                    catalog = cfg,
+                                    offset = 0,
+                                    limit = if (isHardCappedTop10Catalog(cfg.id)) TOP_10_ITEM_LIMIT else 20
+                                )
+                                if (result.items.isNotEmpty()) {
+                                    val category = Category(id = cfg.id, title = cfg.title, items = result.items)
+                                        .withTop10CapIfNeeded()
+                                    withContext(Dispatchers.Main.immediate) {
+                                        if (requestId == loadHomeRequestId) {
+                                            updateMobileCategoryRow(cfg.id, category,
+                                                hasMore = result.hasMore && !isHardCappedTop10Catalog(cfg.id),
+                                                nextOffset = result.nextOffset)
+                                        }
+                                    }
+                                    category
+                                } else null
+                            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+ null }
+                        }
+                    }
+                    val mdblistCategories = mdblistInitial.awaitAll().filterNotNull()
+                    loadedFreshCatalogRows = loadedFreshCatalogRows || mdblistCategories.any { hasRealItems(it) }
+                    // Create placeholder categories for deferred ones (will load on scroll)
+                    val deferredCategories = deferredBatch.map { cfg -> Category(id = cfg.id, title = cfg.title, items = emptyList()) }
+                    // Merge both lists maintaining the saved catalog order
+                    val allPreinstalledById = (tmdbPreinstalled + mdblistCategories + deferredCategories).associateBy { it.id }
+
+                    // Load deferred catalogs in background in batches of 3
+                    if (deferredBatch.isNotEmpty()) {
+                        viewModelScope.launch(networkDispatcher) {
+                            deferredBatch.chunked(3).forEach { batch ->
+                                val results = batch.map { cfg ->
+                                    async {
+                                        try {
+                                            val result = mediaRepository.loadCustomCatalogPage(
+                                                catalog = cfg,
+                                                offset = 0,
+                                                limit = if (isHardCappedTop10Catalog(cfg.id)) TOP_10_ITEM_LIMIT else 20
+                                            )
+                                            if (result.items.isNotEmpty()) {
+                                                val category = Category(id = cfg.id, title = cfg.title, items = result.items)
+                                                    .withTop10CapIfNeeded()
+                                                withContext(Dispatchers.Main.immediate) {
+                                                    if (requestId == loadHomeRequestId) {
+                                                        updateMobileCategoryRow(cfg.id, category,
+                                                            hasMore = result.hasMore && !isHardCappedTop10Catalog(cfg.id),
+                                                            nextOffset = result.nextOffset)
+                                                    }
+                                                }
+                                                category
+                                            } else null
+                                        } catch (e: Exception) {
+                if (e is CancellationException) throw e
+ null }
+                                    }
+                                }.awaitAll().filterNotNull()
+                                if (results.isNotEmpty() && requestId == loadHomeRequestId) {
+                                    markHomeDataLoadSuccessful(requestId)
+                                }
+                            }
+                        }
+                    }
+                    val preinstalled = savedCatalogs
+                        .filter {
+                            it.isPreinstalled &&
+                                !isCollectionRailConfig(it) &&
+                                !isCollectionTileConfig(it)
+                        }
+                        .mapNotNull { cfg -> allPreinstalledById[cfg.id] }
+                    val freshCustomCategories = customJobs.awaitAll().filterNotNull()
+                    loadedFreshCatalogRows = loadedFreshCatalogRows || freshCustomCategories.any { hasRealItems(it) }
+
+                    // Fall back to previously cached data for any custom catalog
+                    // that failed to load in this round
+                    val stickyCustomById = currentBaseCategories
+                        .filter { category ->
+                            customCatalogConfigs.any { it.id == category.id } && category.items.isNotEmpty()
+                        }
+                        .associateBy { it.id }
+                    val freshCustomById = freshCustomCategories.associateBy { it.id }
+
+                    // Build the final list following the user's savedCatalogs order
+                    // for ALL catalog types (preinstalled, MDBList, custom/Trakt).
+                    // The previous code added all preinstalled first, then appended
+                    // custom catalogs at the end — which ignored the user's configured
+                    // ordering and always put Favorite TV before custom catalogs
+                    // regardless of where the user placed it.
+                    val allById = LinkedHashMap<String, Category>()
+                    // Seed with preinstalled data
+                    preinstalled.forEach { allById[it.id] = it }
+                    // Layer on fresh custom catalog data (prefer fresh, fall back to cached)
+                    customCatalogConfigs.forEach { cfg ->
+                        val cat = freshCustomById[cfg.id]
+                            ?: stickyCustomById[cfg.id]
+                            ?: return@forEach
+                        allById[cat.id] = cat
+                    }
+                    // Fallback: if no preinstalled loaded at all, use base/cached
+                    if (preinstalled.isEmpty()) {
+                        val fallback = baseCategories.ifEmpty { currentBaseCategories.ifEmpty { lastResolvedBaseCategories } }
+                        fallback.forEach { allById.putIfAbsent(it.id, it) }
+                    }
+
+                    // Resolve in savedCatalogs order — this is the user's configured
+                    // catalog ordering from Settings > Catalogs.
+                    // Addon catalogs named after a service (Netflix, Disney+ from
+                    // AIOMetadata) are shown like any other row, as in other Stremio
+                    // clients: the user enabled them in their addon, and a duplicate of
+                    // the built-in Services row can be removed in Settings > Catalogs.
+                    val resolved = savedCatalogs.mapNotNull { cfg ->
+                        if (isCollectionRailConfig(cfg) || isCollectionTileConfig(cfg)) {
+                            return@mapNotNull null
+                        }
+                        val cat = allById[cfg.id]
+                        if (cat == null || cat.items.isEmpty()) return@mapNotNull null
+                        cat.withTop10CapIfNeeded()
+                    }.toMutableList()
+                    resolved
+                }
+                val collectionRows = withContext(networkDispatcher) {
+                    val collectionConfigs = savedCatalogs.filter { cfg ->
+                        isCollectionTileConfig(cfg) && CollectionTemplateManifest.isValidCollectionConfig(cfg)
+                    }
+
+                    savedCatalogs.mapNotNull { cfg ->
+                        if (!isCollectionRailConfig(cfg) || !CollectionTemplateManifest.isValidCollectionConfig(cfg)) {
+                            return@mapNotNull null
+                        }
+                        val railKey = cfg.collectionRailKeyOrGroup ?: return@mapNotNull null
+                        val items = collectionConfigs
+                            .filter { it.collectionRailKeyOrGroup == railKey }
+                        if (items.isEmpty()) {
+                            null
+                        } else {
+                            HomeCollectionRow(
+                                id = collectionRowId(railKey),
+                                title = cfg.title,
+                                items = items
+                            )
+                        }
+                    }
+                }
+                val categoryById = categories.associateBy { it.id }
+                val collectionCategoryById = collectionRows.associateBy { it.id }
+                categories = savedCatalogs.mapNotNull { cfg ->
+                    when {
+                        isCollectionTileConfig(cfg) -> null
+                        isCollectionRailConfig(cfg) -> {
+                            val railKey = cfg.collectionRailKeyOrGroup ?: return@mapNotNull null
+                            collectionCategoryById[collectionRowId(railKey)]?.let { toCollectionCategory(it) }
+                        }
+                        else -> categoryById[cfg.id]
+                    }
+                }.toMutableList()
+                if (categories.any { it.id != "continue_watching" && !it.id.startsWith("collection_row_") }) {
+                    lastResolvedBaseCategories = categories.filter {
+                        it.id != "continue_watching" && !it.id.startsWith("collection_row_")
+                    }
+                }
+                categories.forEach { category ->
+                    if (category.id != "continue_watching" && !category.id.startsWith("collection_row_")) {
+                        categoryPaginationStates.putIfAbsent(category.id, CategoryPaginationState(
+                            loadedCount = category.items.size,
+                            hasMore = !isSportsCatalogRow(category.id) &&
+                                category.items.size >= getCategoryPageSize(category.id) &&
+                                !isHardCappedTop10Catalog(category.id)
+                        ))
+                    }
+                }
+                if (requestId != loadHomeRequestId) return@loadHome
+
+                // CW resolution is decoupled from loadHomeData to prevent cancellation.
+                // loadHomeData() is called multiple times during startup (profile load,
+                // catalog observer, cloud pull) — each call cancels the previous one via
+                // loadHomeJob?.cancel(). When getContinueWatching() was inside this job,
+                // the 30-60s Trakt API fetch (97+ shows × progress call) was always
+                // getting cancelled before it could finish. Now it runs in its own
+                // independent coroutine that survives loadHomeData restarts.
+                val existingCW = _uiState.value.categories.firstOrNull {
+                    it.id == "continue_watching" && it.items.isNotEmpty() &&
+                        it.items.none { item -> item.isPlaceholder }
+                }
+                if (existingCW != null) {
+                    categories.add(0, existingCW)
+                } else if (cachedContinueWatching.isNotEmpty()) {
+                    // Show the persisted CW cache instantly regardless of
+                    // whether Trakt is connected. For Trakt users, the cache
+                    // holds the last-successful Trakt resolution, so there's
+                    // no reason to gate it behind auth — the slow fresh
+                    // Trakt fetch (launchContinueWatchingFetch below) will
+                    // still overwrite the row when it finishes. Previously
+                    // Trakt users saw the row disappear during loadHomeData
+                    // and only reappear 30-60s later when the fresh fetch
+                    // completed.
+                    val merged = mergeContinueWatchingResumeData(cachedContinueWatching)
+                    val cwCat = Category(
+                        id = "continue_watching",
+                        title = "Continue Watching",
+                        items = merged.map { it.toMediaItem() }
+                    )
+                    categories.add(0, cwCat)
+                }
+                // Launch the independent CW fetch
+                launchContinueWatchingFetch()
+
+                val heroItem = _uiState.value.heroItem ?: chooseInitialHero(categories)
+
+                // The catalog rows are complete enough to use now. Logo lookups and
+                // image preloads continue below and update decoration independently.
+                // Previously the whole page stayed in skeleton state until every logo
+                // request completed.
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    isInitialLoad = false,
+                    categories = preserveExtendedCatalogRows(categories, _uiState.value.categories),
+                    collectionRows = collectionRows,
+                    categoryHasMoreMap = categoryPaginationStates.mapValues { it.value.hasMore },
+                    error = null
+                ).withBackgroundHero(heroItem, null)
+
+                // Preload logos for the first visible rows so card overlays appear immediately.
+                // Skip IPTV items — their channel logo is already in item.image.
+                // Skip items with disk-cached logos — no network call needed.
+                val itemsToPreload = categories
+                    .take(initialLogoPrefetchRows)
+                    .flatMap { it.items.take(initialLogoPrefetchItemsPerRow) }
+                    .filter { isActionableMediaItem(it) && !isIptvItem(it) }
+
+                // Separate: items already in logo cache (instant) vs items needing fetch
+                val cachedLogoResults = mutableMapOf<String, String>()
+                val itemsNeedingFetch = mutableListOf<MediaItem>()
+                for (item in itemsToPreload) {
+                    val key = "${item.mediaType}_${item.id}"
+                    val cached = getCachedLogo(key)
+                    if (cached != null) {
+                        cachedLogoResults[key] = cached
+                    } else {
+                        itemsNeedingFetch.add(item)
+                    }
+                }
+
+                // If we have disk-cached logos, publish them immediately (before network fetch)
+                if (cachedLogoResults.isNotEmpty()) {
+                    val heroLogoFromCache = heroItem?.let { item ->
+                        val key = "${item.mediaType}_${item.id}"
+                        cachedLogoResults[key]
+                    }
+                    if (heroLogoFromCache != null || cachedLogoResults.isNotEmpty()) {
+                        // Use high batch limit for initial display — preload all cached logos at once
+                        if (isStartupSettling()) {
+                            scheduleStartupImageWarmup(logoUrls = cachedLogoResults.values.toList())
+                        } else {
+                            preloadLogoImages(
+                                cachedLogoResults.values.toList(),
+                                batchLimit = if (isLowRamDevice) 4 else 6
+                            )
+                        }
+                        _uiState.value = _uiState.value.copy(
+                            isLoading = _uiState.value.isLoading,
+                            categories = preserveExtendedCatalogRows(categories, _uiState.value.categories),
+                            collectionRows = collectionRows,
+                            categoryHasMoreMap = categoryPaginationStates.mapValues { it.value.hasMore }
+                        ).withBackgroundHero(heroItem, heroLogoFromCache)
+                        _uiState.value.heroItem?.let { item ->
+                            if (isStartupSettling()) {
+                                scheduleStartupHeroHydration(item)
+                            } else {
+                                hydrateHeroDetailsIfNeeded(item)
+                            }
+                        }
+                        replaceCardLogoState(snapshotLogoCache())
+                    }
+                }
+
+                // Fetch remaining logos from TMDB (only items not in disk cache)
+                val logoJobs = itemsNeedingFetch.map { item ->
+                    async(networkDispatcher) {
+                        val key = "${item.mediaType}_${item.id}"
+                        try {
+                            // Issue 1: logo decoration trickles through BACKGROUND.
+                            val logoUrl = tmdbPriorityDispatcher.withPermit(Priority.BACKGROUND) {
+                                mediaRepository.getLogoUrl(item.mediaType, item.id)
+                            }
+                            if (logoUrl != null) key to logoUrl else null
+                        } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                            null
+                        }
+                    }
+                }
+                val fetchedLogoResults = logoJobs.awaitAll().filterNotNull().toMap()
+                if (requestId != loadHomeRequestId) return@loadHome
+
+                val logoResults = cachedLogoResults + fetchedLogoResults
+
+                // Phase 1.2: Preload actual images with Coil (only newly fetched)
+                if (fetchedLogoResults.isNotEmpty()) {
+                    if (isStartupSettling()) {
+                        scheduleStartupImageWarmup(logoUrls = fetchedLogoResults.values.toList())
+                    } else {
+                        preloadLogoImages(
+                            fetchedLogoResults.values.toList(),
+                            batchLimit = if (isLowRamDevice) 4 else 6
+                        )
+                    }
+                }
+
+                // Also preload backdrop images for first row
+                val backdropUrls = categories.firstOrNull()?.items?.take(initialBackdropPrefetchItems)?.mapNotNull {
+                    it.backdrop ?: it.image
+                } ?: emptyList()
+                if (isStartupSettling()) {
+                    scheduleStartupImageWarmup(backdropUrls = backdropUrls)
+                } else {
+                    preloadBackdropImages(backdropUrls)
+                }
+
+                val heroLogoUrl = heroItem?.let { item ->
+                    val key = "${item.mediaType}_${item.id}"
+                    getCachedLogo(key) ?: logoResults[key]
+                }
+
+                putCachedLogos(logoResults)
+
+                val authenticated = traktRepository.isAuthenticated.first()
+                if (requestId != loadHomeRequestId) return@loadHome
+                _uiState.update { current ->
+                    current.copy(
+                        isLoading = false,
+                        isInitialLoad = false,
+                        categories = preserveExtendedCatalogRows(categories, current.categories),
+                        collectionRows = collectionRows,
+                        isAuthenticated = authenticated,
+                        categoryHasMoreMap = categoryPaginationStates.mapValues { it.value.hasMore },
+                        error = null
+                    ).withBackgroundHero(heroItem, heroLogoUrl)
+                }
+                // Cached fallback rows keep Home usable, but only freshly fetched rows
+                // suppress the next resume retry.
+                if (loadedFreshCatalogRows) {
+                    markHomeDataLoadSuccessful(requestId)
+                }
+                _uiState.value.heroItem?.let { item ->
+                    if (isStartupSettling()) {
+                        scheduleStartupHeroHydration(item)
+                    } else {
+                        hydrateHeroDetailsIfNeeded(item)
+                    }
+                }
+                replaceCardLogoState(snapshotLogoCache())
+                refreshWatchedBadges()
+                scheduleStartupCatalogImageWarmup(categories)
+
+                // Persist the real categories to disk so the next app launch
+                // shows them immediately without waiting for TMDB API calls.
+                viewModelScope.launch(Dispatchers.IO) {
+                    runCatching { persistCategoriesCache(categories) }
+                }
+
+                // On mobile/touch devices, prefetch logos for ALL categories in the background
+                // since there's no D-pad focus to trigger incremental loading.
+                if (!isLowRamDevice && !isTvDevice) {
+                    viewModelScope.launch(networkDispatcher) {
+                        delay(1_500L) // Let initial UI settle first
+                        for (i in initialLogoPrefetchRows until categories.size) {
+                            preloadLogosForCategory(i, prioritizeVisible = false)
+                            delay(300L) // Stagger to avoid API rate limiting
+                        }
+                    }
+                }
+
+                // If the cached Favorite TV row has stale/empty EPG text, refresh it
+                // after Home has had time to settle. Doing network EPG work during
+                // startup competes with TV D-pad navigation and causes GC stalls.
+                val favTvCat = _uiState.value.categories.firstOrNull { it.id == FAVORITE_TV_CATEGORY_ID }
+                if (favTvCat != null && favTvCat.items.any { it.overview == "Live TV" }) {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        delay(if (isLowRamDevice) 8 * 60_000L else 6 * 60_000L)
+                        val channelIds = favTvCat.items.mapNotNull { getIptvChannelId(it) }.toSet()
+                        if (channelIds.isNotEmpty()) {
+                            refreshFavoriteTvEpg(networkFetch = false)
+                            // Also update hero if it's an IPTV item showing stale EPG
+                            val currentHero = _uiState.value.heroItem
+                            if (currentHero != null && isIptvItem(currentHero) && currentHero.overview == "Live TV") {
+                                val updatedCat = _uiState.value.categories.firstOrNull { it.id == FAVORITE_TV_CATEGORY_ID }
+                                val updatedHero = updatedCat?.items?.firstOrNull { it.id == currentHero.id }
+                                if (updatedHero != null) {
+                                    withContext(Dispatchers.Main.immediate) {
+                                        _uiState.update { current ->
+                                            if (current.heroItem.isSameHomeHero(updatedHero)) {
+                                                current.copy(heroItem = updatedHero)
+                                            } else current
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Custom catalogs are now loaded in the bulk path above (parallel
+                // fetch alongside TMDB + MDBList). No need for incremental loading
+                // which caused the slow one-by-one appearance and the viewport "trip"
+                // when rows were inserted mid-list.
+
+                viewModelScope.launch cw@{
+                    if (requestId != loadHomeRequestId) return@cw
+                    delay(if (isLowRamDevice) 2_200L else 1_200L)
+                    if (requestId != loadHomeRequestId) return@cw
+                    refreshContinueWatchingOnly(force = true)
+                }
+              } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                if (requestId != loadHomeRequestId) return@loadHome
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    isInitialLoad = false,
+                    error = if (_uiState.value.categories.isEmpty()) e.message ?: context.getString(R.string.home_failed_load_content) else null
+                )
+            } finally {
+            }
+        }
+    }
+
+    private fun updateMobileCategoryRow(
+        categoryId: String,
+        newCategory: Category,
+        hasMore: Boolean = false,
+        nextOffset: Int? = null
+    ) {
+        val currentCategories = _uiState.value.categories.toMutableList()
+        val index = currentCategories.indexOfFirst { it.id == categoryId }
+        if (index >= 0) {
+            currentCategories[index] = newCategory
+        } else {
+            currentCategories.add(newCategory)
+        }
+        val orderedCategories = orderCategoriesBySavedCatalogs(currentCategories, currentSavedCatalogs)
+        categoryPaginationStates[categoryId] = CategoryPaginationState(
+            loadedCount = newCategory.items.size,
+            hasMore = hasMore,
+            nextOffset = nextOffset ?: newCategory.items.size
+        )
+        val currentHero = _uiState.value.heroItem
+        val newHero = if (currentHero == null) {
+            chooseInitialHero(orderedCategories)
+        } else {
+            currentHero
+        }
+        val heroLogo = newHero?.let { getCachedLogo("${it.mediaType}_${it.id}") }
+
+        _uiState.value = _uiState.value.copy(
+            isLoading = false,
+            isInitialLoad = false,
+            categories = orderedCategories,
+            heroItem = newHero,
+            heroLogoUrl = heroLogo ?: _uiState.value.heroLogoUrl,
+            categoryHasMoreMap = categoryPaginationStates.mapValues { it.value.hasMore },
+            error = null,
+            isMobileSlowLoading = false
+        )
+        if (newHero != null && _uiState.value.heroLogoUrl == null) {
+            hydrateHeroDetailsIfNeeded(newHero)
+        }
+        preloadLogosForCategoryItems(newCategory.items.take(8))
+    }
+
+    private fun preloadLogosForCategoryItems(items: List<MediaItem>) {
+        viewModelScope.launch(networkDispatcher) {
+            items.filter { isActionableMediaItem(it) && !isIptvItem(it) }.forEach { item ->
+                val key = "${item.mediaType}_${item.id}"
+                if (!cardLogoUrls.containsKey(key)) {
+                    val cached = getCachedLogo(key)
+                    if (cached != null) {
+                        withContext(Dispatchers.Main.immediate) {
+                            cardLogoUrls[key] = cached
+                        }
+                    } else {
+                        try {
+                            // Issue 1: card logo decoration is BACKGROUND.
+                            val url = tmdbPriorityDispatcher.withPermit(Priority.BACKGROUND) {
+                                mediaRepository.getLogoUrl(item.mediaType, item.id)
+                            }
+                            if (url != null) {
+                                withContext(Dispatchers.Main.immediate) {
+                                    cardLogoUrls[key] = url
+                                }
+                            }
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun preloadImdbRatingsForHeroItems(items: List<MediaItem>) {
+        preloadLogosForCategoryItems(items)
+        viewModelScope.launch(networkDispatcher) {
+            items.filter { isActionableMediaItem(it) && !isIptvItem(it) }.forEach { item ->
+                val key = "${item.mediaType}_${item.id}"
+                if (!cardImdbRatings.containsKey(key)) {
+                    try {
+                        val rating = mediaRepository.getImdbRating(item.mediaType, item.id)
+                        if (!rating.isNullOrBlank()) {
+                            withContext(Dispatchers.Main.immediate) {
+                                cardImdbRatings[key] = rating
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                    }
+                }
+            }
+        }
+    }
+
+    fun retryMobileHomeLoading() {
+        _uiState.value = _uiState.value.copy(isMobileSlowLoading = false, isLoading = true)
+        loadHomeData()
+    }
+
+    private fun loadMobileHomeDataProgressive(
+        requestId: Long,
+        savedCatalogs: List<CatalogConfig>,
+        cachedContinueWatching: List<ContinueWatchingItem>,
+        hasRemoteContinueWatching: Boolean = false
+    ) {
+        // 1. Initial Skeleton Setup: render structured skeletons in saved catalog order immediately
+        val skeletonCategories = buildProfileSkeletonCategories(
+            savedCatalogs = savedCatalogs,
+            cachedContinueWatching = cachedContinueWatching,
+            hasRemoteContinueWatching = hasRemoteContinueWatching
+        )
+        val existingCw = _uiState.value.categories.firstOrNull { it.id == "continue_watching" && it.items.isNotEmpty() }
+        val hasRealBaseCategories = _uiState.value.categories.any {
+            it.id != "continue_watching" && !it.id.startsWith("collection_row_") && it.items.any { item -> !item.isPlaceholder }
+        }
+        if (!hasRealBaseCategories) {
+            val initialSkeleton = if (existingCw != null) {
+                listOf(existingCw) + skeletonCategories.filterNot { it.id == "continue_watching" }
+            } else {
+                skeletonCategories
+            }
+            val skeletonHero = chooseInitialHero(initialSkeleton)
+            _uiState.value = _uiState.value.copy(
+                isLoading = true,
+                isInitialLoad = false,
+                categories = initialSkeleton,
+                heroItem = skeletonHero,
+                heroLogoUrl = null,
+                error = null,
+                isMobileSlowLoading = false
+            )
+        } else {
+            // Rows are refreshed in place below, so a catalog removed since the last load has
+            // to be dropped here or it stays on Home (and in the categories cache).
+            _uiState.value = _uiState.value.copy(
+                categories = dropCategoriesMissingFromSavedCatalogs(_uiState.value.categories, savedCatalogs),
+                isLoading = false,
+                error = null,
+                isMobileSlowLoading = false
+            )
+        }
+
+        // 2. Resolve Collection Rails immediately (Services, Franchises, Genres)
+        val collectionConfigs = savedCatalogs.filter { cfg ->
+            isCollectionTileConfig(cfg) && CollectionTemplateManifest.isValidCollectionConfig(cfg)
+        }
+        val collectionRows = savedCatalogs.mapNotNull { cfg ->
+            if (!isCollectionRailConfig(cfg) || !CollectionTemplateManifest.isValidCollectionConfig(cfg)) null
+            else {
+                val railKey = cfg.collectionRailKeyOrGroup ?: return@mapNotNull null
+                val items = collectionConfigs.filter { it.collectionRailKeyOrGroup == railKey }
+                if (items.isEmpty()) null
+                else HomeCollectionRow(id = collectionRowId(railKey), title = cfg.title, items = items)
+            }
+        }
+        _uiState.value = _uiState.value.copy(collectionRows = collectionRows)
+        collectionRows.forEach { colRow ->
+            updateMobileCategoryRow(colRow.id, toCollectionCategory(colRow))
+        }
+
+        // 3. Resolve Continue Watching from cache & launch live sync
+        if (cachedContinueWatching.isNotEmpty()) {
+            viewModelScope.launch {
+                val merged = mergeContinueWatchingResumeData(cachedContinueWatching)
+                val cwCat = Category(
+                    id = "continue_watching",
+                    title = "Continue Watching",
+                    items = merged.map { it.toMediaItem() }
+                )
+                withContext(Dispatchers.Main.immediate) {
+                    if (requestId == loadHomeRequestId) {
+                        updateMobileCategoryRow("continue_watching", cwCat)
+                    }
+                }
+            }
+        }
+        launchContinueWatchingFetch()
+
+        // 4. Favorite TV (IPTV) on IO
+        viewModelScope.launch(Dispatchers.IO) {
+            val favCat = runCatching { buildFavoriteTvCategory() }.getOrNull()
+            if (favCat != null && favCat.items.isNotEmpty()) {
+                withContext(Dispatchers.Main.immediate) {
+                    if (requestId == loadHomeRequestId) {
+                        updateMobileCategoryRow(FAVORITE_TV_CATEGORY_ID, favCat)
+                    }
+                }
+            }
+        }
+
+        // 5. TMDB Built-in Categories (Trending Movies, Shows, Anime) - fast independent single-request fetches
+        val tmdbConfigs = savedCatalogs.filter {
+            (it.id in BUILTIN_TMDB_CATEGORY_IDS) || (it.isPreinstalled && it.sourceUrl.isNullOrBlank() && !isCollectionRailConfig(it) && !isCollectionTileConfig(it))
+        }
+        tmdbConfigs.forEach { cfg ->
+            viewModelScope.launch(networkDispatcher) {
+                // Initial rows must not wait for speculative artwork. Keep this
+                // batch capped at two, leaving the immediate lane for user intent.
+                val page = runCatching {
+                    tmdbPriorityDispatcher.withPermit(Priority.DEFERRED) {
+                        mediaRepository.loadHomeCategoryPage(cfg.id, 1)
+                    }
+                }.getOrNull()
+                if (page != null && page.items.isNotEmpty()) {
+                    val category = Category(id = cfg.id, title = cfg.title, items = page.items)
+                    withContext(Dispatchers.Main.immediate) {
+                        if (requestId == loadHomeRequestId) {
+                            updateMobileCategoryRow(cfg.id, category.withTop10CapIfNeeded(), hasMore = page.hasMore)
+                            markHomeDataLoadSuccessful(requestId)
+                            persistCategoriesCache(_uiState.value.categories)
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. MDBList and Custom/Addon Catalogs - progressive fetch with higher concurrency
+        val customConfigs = savedCatalogs.filter { cfg ->
+            cfg.id !in BUILTIN_TMDB_CATEGORY_IDS &&
+                (isCustomCatalogConfig(cfg) || (cfg.isPreinstalled && !cfg.sourceUrl.isNullOrBlank() && !isCollectionRailConfig(cfg) && !isCollectionTileConfig(cfg)))
+        }
+        val customSemaphore = Semaphore(if (isLowRamDevice) 3 else 6)
+        customConfigs.forEach { cfg ->
+            viewModelScope.launch(networkDispatcher) {
+                customSemaphore.withPermit {
+                    try {
+                        val limit = if (isHardCappedTop10Catalog(cfg.id)) TOP_10_ITEM_LIMIT else catalogInitialLimit(cfg)
+                        val result = mediaRepository.loadCustomCatalogPage(catalog = cfg, offset = 0, limit = limit)
+                        if (result.items.isNotEmpty()) {
+                            val category = Category(id = cfg.id, title = cfg.title, items = result.items).withTop10CapIfNeeded()
+                            withContext(Dispatchers.Main.immediate) {
+                                if (requestId == loadHomeRequestId) {
+                                    updateMobileCategoryRow(cfg.id, category, hasMore = result.hasMore && !isHardCappedTop10Catalog(cfg.id), nextOffset = result.nextOffset)
+                                    markHomeDataLoadSuccessful(requestId)
+                                    persistCategoriesCache(_uiState.value.categories)
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                    }
+                }
+            }
+        }
+
+        // 7. Slow loading watcher for first cold start
+        viewModelScope.launch {
+            delay(8000L)
+            if (requestId == loadHomeRequestId) {
+                val hasReal = _uiState.value.categories.any { cat ->
+                    cat.id != "continue_watching" && cat.items.any { !it.isPlaceholder }
+                }
+                if (!hasReal) {
+                    _uiState.value = _uiState.value.copy(isMobileSlowLoading = true)
+                }
+            }
+        }
+    }
+
+    /**
+     * Warm critical details assets while the card is focused so opening Details feels instant:
+     * - clearlogo URL
+     * - next-episode season episodes for TV (or season 1)
+     * The calls hit in-memory/network caches and are safe to fire-and-forget.
+     */
+    fun prefetchDetailsAssets(item: MediaItem) {
+        if (!isActionableMediaItem(item) || isIptvItem(item) || isCollectionItem(item)) return
+        val key = "${item.mediaType}_${item.id}_${item.nextEpisode?.seasonNumber ?: 1}"
+        if (!prefetchedDetailsKeys.add(key)) return
+        viewModelScope.launch(networkDispatcher) {
+            // Issue 1: focus-prefetch decoration shares the BACKGROUND budget.
+            tmdbPriorityDispatcher.withPermit(Priority.BACKGROUND) {
+                runCatching { mediaRepository.getLogoUrl(item.mediaType, item.id) }
+                if (item.mediaType == MediaType.TV) {
+                    val season = item.nextEpisode?.seasonNumber ?: 1
+                    runCatching { mediaRepository.getSeasonEpisodes(item.id, season) }
+                }
+            }
+        }
+    }
+
+    private fun loadCustomCatalogsIncrementally(savedCatalogs: List<CatalogConfig>) {
+        customCatalogsJob?.cancel()
+        customCatalogsJob = viewModelScope.launch(networkDispatcher) {
+            delay(if (isLowRamDevice) 700L else 350L)
+            val customCatalogs = savedCatalogs.filter { cfg -> isCustomCatalogConfig(cfg) }
+            if (customCatalogs.isEmpty()) return@launch
+            val customIds = customCatalogs.map { it.id }.toSet()
+            val existingCustomById = _uiState.value.categories
+                .filter { category -> customIds.contains(category.id) && category.items.isNotEmpty() }
+                .associateBy { it.id }
+            val baseCategories = _uiState.value.categories.filterNot { customIds.contains(it.id) }
+            val baseById = baseCategories.associateBy { it.id }
+
+            val loadedById = java.util.concurrent.ConcurrentHashMap<String, Category>()
+            var lastCustomCatalogPublishMs = 0L
+            fun publishMerged() {
+                val latestState = _uiState.value
+                val currentCategories = latestState.categories.toMutableList()
+
+                // Preserve CW from latest state
+                val latestCW = latestState.categories.firstOrNull {
+                    it.id == "continue_watching" && it.items.isNotEmpty()
+                }
+
+                // For each custom catalog that has loaded, update it IN-PLACE if it
+                // already has a slot in the displayed list, or APPEND it at the end
+                // if it's brand new. This prevents mid-list insertions that cause
+                // LazyColumn to re-layout and the viewport to jump ("trip" bug).
+                // Base (TMDB) catalogs are NOT touched here — they're set in the
+                // main loadHomeData path which does a single bulk replacement.
+                var anyChange = false
+                for (id in customIds) {
+                    val freshData = loadedById[id]
+                        ?: existingCustomById[id]
+                        ?: continue
+                    if (freshData.items.isEmpty()) continue
+
+                    val existingIdx = currentCategories.indexOfFirst { it.id == id }
+                    if (existingIdx >= 0) {
+                        if (currentCategories[existingIdx].items.size != freshData.items.size) {
+                            currentCategories[existingIdx] = freshData
+                            anyChange = true
+                        }
+                    } else {
+                        // Append new custom catalog at end — no mid-list insert
+                        currentCategories.add(freshData)
+                        anyChange = true
+                    }
+                }
+
+                // Also update Favorite TV if it exists in base but not yet in displayed list
+                val favTv = baseById[FAVORITE_TV_CATEGORY_ID]
+                if (favTv != null && favTv.items.isNotEmpty()) {
+                    val favIdx = currentCategories.indexOfFirst { it.id == FAVORITE_TV_CATEGORY_ID }
+                    if (favIdx >= 0) {
+                        currentCategories[favIdx] = favTv
+                        anyChange = true
+                    } else {
+                        currentCategories.add(favTv)
+                        anyChange = true
+                    }
+                }
+
+                // Restore CW at position 0
+                if (latestCW != null) {
+                    val cwIdx = currentCategories.indexOfFirst { it.id == "continue_watching" }
+                    if (cwIdx >= 0) {
+                        currentCategories[cwIdx] = latestCW
+                    } else {
+                        currentCategories.add(0, latestCW)
+                        anyChange = true
+                    }
+                }
+
+                if (!anyChange) return
+                _uiState.value = latestState.copy(
+                    categories = currentCategories,
+                    categoryHasMoreMap = categoryPaginationStates.mapValues { it.value.hasMore }
+                )
+            }
+            suspend fun publishMergedThrottled(force: Boolean = false) {
+                if (!force) {
+                    val elapsed = SystemClock.elapsedRealtime() - lastCustomCatalogPublishMs
+                    val waitMs = (450L - elapsed).coerceAtLeast(0L)
+                    if (waitMs > 0L) delay(waitMs)
+                }
+                withContext(Dispatchers.Main.immediate) {
+                    publishMerged()
+                    lastCustomCatalogPublishMs = SystemClock.elapsedRealtime()
+                }
+            }
+            publishMergedThrottled(force = true)
+
+            // Load custom catalogs in parallel (up to 3 concurrently) for faster appearance
+            val catalogSemaphore = kotlinx.coroutines.sync.Semaphore(if (isLowRamDevice) 2 else 3)
+            val jobs = customCatalogs.map { catalog ->
+                async(networkDispatcher) {
+                    catalogSemaphore.withPermit {
+                        val firstPage = runCatching {
+                            mediaRepository.loadCustomCatalogPage(
+                                catalog = catalog,
+                                offset = 0,
+                                limit = catalogInitialLimit(catalog)
+                            )
+                        }.getOrNull()
+                        if (firstPage == null || firstPage.items.isEmpty()) {
+                            loadedById[catalog.id] = Category(
+                                id = catalog.id,
+                                title = catalog.title,
+                                items = emptyList()
+                            )
+                            categoryPaginationStates[catalog.id] = CategoryPaginationState(
+                                loadedCount = 0,
+                                hasMore = false
+                            )
+                        } else {
+                            val category = Category(
+                                id = catalog.id,
+                                title = catalog.title,
+                                items = firstPage.items
+                            ).withTop10CapIfNeeded()
+                            loadedById[catalog.id] = category
+                            categoryPaginationStates[catalog.id] = CategoryPaginationState(
+                                loadedCount = category.items.size,
+                                hasMore = firstPage.hasMore && !isHardCappedTop10Catalog(catalog.id),
+                                nextOffset = firstPage.nextOffset ?: category.items.size
+                            )
+                        }
+                        // Coalesce incremental row inserts so catalog arrivals do
+                        // not repeatedly relayout Home while the user is scrolling.
+                        publishMergedThrottled()
+                    }
+                }
+            }
+            jobs.awaitAll()
+        }
+    }
+
+    fun maybeLoadNextPageForCategory(categoryId: String, focusedItemIndex: Int) {
+        if (categoryId == "continue_watching") return
+        if (isHardCappedTop10Catalog(categoryId)) return
+        val currentCategory = _uiState.value.categories.firstOrNull { it.id == categoryId } ?: return
+        if (currentCategory.items.isEmpty() || currentCategory.items.all { it.isPlaceholder }) return
+        // A kids profile reports positions in the filtered row; page on the unfiltered one.
+        val index = KidsPaging.rawIndex(
+            currentCategory.items, kidsContentFilter.state.value, focusedItemIndex, nearEndThreshold
+        )
+        if (index < currentCategory.items.size - nearEndThreshold) return
+        loadNextHomeRowPage(categoryId)
+    }
+
+    /** Next page for a home rail, capped at [homeRowAutoPageLimit] for rows that end in "View all". */
+    fun loadNextHomeRowPage(categoryId: String) {
+        val category = _uiState.value.categories.firstOrNull { it.id == categoryId } ?: return
+        val realCount = category.items.count { !it.isPlaceholder }
+        val hasMore = _uiState.value.categoryHasMoreMap[categoryId] == true
+        if (realCount >= homeRowAutoPageLimit && homeRowSupportsViewAll(category, hasMore)) return
+        loadNextPageForCategory(categoryId)
+    }
+
+    fun onMobileCategoryVisiblePosition(categoryId: String, lastVisibleItemIndex: Int) {
+        if (lastVisibleItemIndex < 0) return
+        maybeLoadNextPageForCategory(categoryId, lastVisibleItemIndex)
+        prefetchLogosAroundCategoryPosition(categoryId, lastVisibleItemIndex)
+    }
+
+    /**
+     * "View all" grid scroll position. A grid shows several rows at once, so the next page
+     * is requested [lookAheadItems] before the end instead of the rail's [nearEndThreshold].
+     */
+    fun onViewAllVisiblePosition(categoryId: String, lastVisibleItemIndex: Int, lookAheadItems: Int) {
+        if (lastVisibleItemIndex < 0) return
+        val category = _uiState.value.categories.firstOrNull { it.id == categoryId } ?: return
+        // A kids profile reports positions in the filtered grid; page on the unfiltered one.
+        val index = KidsPaging.rawIndex(
+            category.items, kidsContentFilter.state.value, lastVisibleItemIndex, lookAheadItems
+        )
+        prefetchLogosAroundCategoryPosition(categoryId, index)
+        val realCount = category.items.count { !it.isPlaceholder }
+        if (index >= realCount - lookAheadItems) {
+            loadNextPageForCategory(categoryId)
+        }
+    }
+
+    /**
+     * Kids profile: keeps loading pages of a filtered grid while fewer than [minVisible] titles
+     * pass, so a page where most or all titles are excluded does not end the list early. The
+     * screen calls it whenever what it shows changes; [MAX_KIDS_TOP_UP_ITEMS] bounds the walk.
+     */
+    fun topUpKidsCategory(categoryId: String, minVisible: Int = 24) {
+        val category = _uiState.value.categories.firstOrNull { it.id == categoryId } ?: return
+        if (category.items.size >= MAX_KIDS_TOP_UP_ITEMS) return
+        if (_uiState.value.categoryHasMoreMap[categoryId] != true) return
+        if (KidsPaging.needsMore(category.items, kidsContentFilter.state.value, minVisible)) {
+            loadNextPageForCategory(categoryId)
+        }
+    }
+
+    private fun prefetchLogosAroundCategoryPosition(categoryId: String, itemIndex: Int) {
+        val category = _uiState.value.categories.firstOrNull { it.id == categoryId } ?: return
+        if (category.id.startsWith("collection_row_") || category.items.isEmpty()) return
+
+        val startIndex = (itemIndex - 2).coerceAtLeast(0)
+        val endIndex = minOf(itemIndex + prioritizedLogoPrefetchItems, category.items.lastIndex)
+        if (startIndex > endIndex) return
+
+        val itemsToLoad = (startIndex..endIndex)
+            .mapNotNull { index -> category.items.getOrNull(index) }
+            .filter { item ->
+                if (!isActionableMediaItem(item) || isIptvItem(item)) return@filter false
+                val key = "${item.mediaType}_${item.id}"
+                !hasCachedLogo(key) && logoFetchInFlight.add(key)
+            }
+
+        if (itemsToLoad.isEmpty()) return
+
+        viewModelScope.launch(networkDispatcher) {
+            val logoJobs = itemsToLoad.map { item ->
+                async(networkDispatcher) {
+                    val key = "${item.mediaType}_${item.id}"
+                    try {
+                        // Issue 1: logo decoration trickles through BACKGROUND.
+                        val logoUrl = tmdbPriorityDispatcher.withPermit(Priority.BACKGROUND) {
+                            mediaRepository.getLogoUrl(item.mediaType, item.id)
+                        }
+                        if (logoUrl != null) key to logoUrl else null
+                    } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                        null
+                    } finally {
+                        logoFetchInFlight.remove(key)
+                    }
+                }
+            }
+            val newLogos = logoJobs.awaitAll().filterNotNull().toMap()
+            if (newLogos.isNotEmpty()) {
+                if (putCachedLogos(newLogos)) {
+                    scheduleLogoCachePublish(highPriority = true)
+                }
+                preloadLogoImages(newLogos.values.toList())
+            }
+        }
+    }
+
+    fun loadNextPageForCategory(categoryId: String) {
+        if (isHardCappedTop10Catalog(categoryId)) return
+        val currentCategory = _uiState.value.categories.firstOrNull { it.id == categoryId } ?: return
+        if (currentCategory.items.isEmpty() || currentCategory.items.all { it.isPlaceholder }) return
+
+        val realItemsCount = currentCategory.items.count { !it.isPlaceholder }
+        val pagination = categoryPaginationStates.getOrPut(categoryId) {
+            CategoryPaginationState(
+                loadedCount = realItemsCount
+            )
+        }
+        if (!pagination.hasMore || pagination.isLoading) return
+
+        pagination.isLoading = true
+        val requestId = loadHomeRequestId
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val currentCategories = _uiState.value.categories
+                val latestCategory = currentCategories.firstOrNull { it.id == categoryId } ?: return@launch
+                val realItems = latestCategory.items.filter { !it.isPlaceholder }
+                if (realItems.isEmpty()) return@launch
+
+                val catalog = savedCatalogById[categoryId]
+                val pageSize = getCategoryPageSize(categoryId)
+                val result = if (categoryId in BUILTIN_TMDB_CATEGORY_IDS ||
+                    (catalog?.isPreinstalled == true && catalog.sourceUrl.isNullOrBlank())
+                ) {
+                    // Pure TMDB preinstalled catalog (no MDBList source)
+                    val nextPage = (realItems.size / 20) + 1
+                    // The viewer is reaching these cards now. Use the bounded
+                    // foreground lane rather than waiting behind artwork preloads.
+                    tmdbPriorityDispatcher.withPermit(Priority.IMMEDIATE) {
+                        mediaRepository.loadHomeCategoryPage(categoryId, nextPage)
+                    }
+                } else {
+                    // MDBList/custom catalog (including preinstalled MDBList ones)
+                    val cfg = catalog ?: return@launch
+                    mediaRepository.loadCustomCatalogPage(
+                        catalog = cfg,
+                        offset = pagination.nextOffset,
+                        limit = pageSize
+                    )
+                }
+
+                if (requestId != loadHomeRequestId || categoryPaginationStates[categoryId] !== pagination) return@launch
+                val oldOffset = pagination.nextOffset
+                pagination.nextOffset = result.nextOffset ?: (oldOffset + result.items.size)
+                if (result.items.isEmpty()) {
+                    pagination.hasMore = result.hasMore && pagination.nextOffset > oldOffset
+                    return@launch
+                }
+
+                val seen = realItems
+                    .map { "${it.mediaType.name}_${it.id}" }
+                    .toHashSet()
+                val uniqueNewItems = result.items.filter { item ->
+                    seen.add("${item.mediaType.name}_${item.id}")
+                }
+                if (uniqueNewItems.isEmpty()) {
+                    pagination.hasMore = false
+                    return@launch
+                }
+
+                uniqueNewItems.forEach { mediaRepository.cacheItem(it) }
+                withContext(Dispatchers.Main.immediate) {
+                    if (requestId != loadHomeRequestId) return@withContext
+                    pagination.loadedCount = realItems.size + uniqueNewItems.size
+                    pagination.hasMore = result.hasMore
+                    _uiState.value = _uiState.value.copy(
+                        categories = _uiState.value.categories.map { category ->
+                            if (category.id == categoryId) category.copy(items = realItems + uniqueNewItems) else category
+                        },
+                        categoryHasMoreMap = _uiState.value.categoryHasMoreMap + (categoryId to result.hasMore)
+                    )
+                }
+                // Artwork enrichment must not hold an already-loaded page off screen.
+                val logoEntries = uniqueNewItems.take(6).mapNotNull { item ->
+                    if (!isActionableMediaItem(item) || isIptvItem(item)) return@mapNotNull null
+                    val key = "${item.mediaType}_${item.id}"
+                    if (hasCachedLogo(key) || !logoFetchInFlight.add(key)) return@mapNotNull null
+                    // Issue 1: page-fill artwork enrichment is BACKGROUND.
+                    val logo = runCatching {
+                        tmdbPriorityDispatcher.withPermit(Priority.BACKGROUND) {
+                            mediaRepository.getLogoUrl(item.mediaType, item.id)
+                        }
+                    }.getOrNull()
+                    logoFetchInFlight.remove(key)
+                    if (logo == null) return@mapNotNull null
+                    key to logo
+                }
+                if (logoEntries.isNotEmpty()) {
+                    val logoMap = logoEntries.toMap()
+                    if (putCachedLogos(logoMap)) {
+                        scheduleLogoCachePublish()
+                    }
+                    preloadLogoImages(logoMap.values.toList())
+                }
+                preloadBackdropImages(uniqueNewItems.take(incrementalBackdropPrefetchItems).mapNotNull { it.backdrop ?: it.image })
+
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                // Keep UI stable; user can retry naturally by continuing to browse the row.
+            } finally {
+                pagination.isLoading = false
+                updatePaginationStatesInUiState()
+            }
+        }
+    }
+
+    private fun updatePaginationStatesInUiState() {
+        val hasMoreMap = categoryPaginationStates.mapValues { it.value.hasMore }
+        _uiState.value = _uiState.value.copy(categoryHasMoreMap = hasMoreMap)
+    }
+
+    private fun createPlaceholderItems(count: Int = HOME_PLACEHOLDER_ITEM_COUNT): List<MediaItem> =
+        (1..count).map { index ->
+            MediaItem(
+                id = -index,
+                title = "",
+                mediaType = MediaType.MOVIE,
+                isPlaceholder = true
+            )
+        }
+
+    private fun buildProfileSkeletonCategories(
+        savedCatalogs: List<com.arflix.tv.data.model.CatalogConfig>,
+        cachedContinueWatching: List<ContinueWatchingItem>,
+        hasRemoteContinueWatching: Boolean = false
+    ): List<Category> {
+        val placeholderItems = createPlaceholderItems()
+
+        val rows = mutableListOf<Category>()
+        // Include Continue Watching in startup skeleton if cached items exist OR user is connected to Trakt / Cloud
+        val hasContinueWatchingPotential = cachedContinueWatching.isNotEmpty() || hasRemoteContinueWatching
+        if (hasContinueWatchingPotential) {
+            rows.add(
+                Category(
+                    id = "continue_watching",
+                    title = "Continue Watching",
+                    items = if (cachedContinueWatching.isNotEmpty()) {
+                        cachedContinueWatching.map { it.toMediaItem() }
+                    } else {
+                        placeholderItems
+                    }
+                )
+            )
+        }
+
+        savedCatalogs.forEach { cfg ->
+            if (isCollectionTileConfig(cfg)) return@forEach
+            // Omit Favorite TV and Popular Live Sports from initial skeleton
+            if (cfg.id == FAVORITE_TV_CATEGORY_ID) return@forEach
+            if (cfg.id == SportsAddonCapabilities.POPULAR_LIVE_TV_ROW_ID) return@forEach
+            if (cfg.id == SportsAddonCapabilities.SPORTS_CATEGORY_ROW_ID) {
+                rows.add(sportsRepository.sportsCategoryOnlyRow(locked = true))
+                return@forEach
+            }
+            val rowItems = if (isCollectionRailConfig(cfg)) {
+                val group = cfg.collectionGroup
+                val matchingConfigs = savedCatalogs.filter {
+                    isCollectionTileConfig(it) && it.collectionGroup == group
+                }
+                if (matchingConfigs.isNotEmpty()) {
+                    matchingConfigs.mapIndexed { idx, itemCfg ->
+                        MediaItem(
+                            id = -100 - idx,
+                            title = "",
+                            mediaType = MediaType.MOVIE,
+                            isPlaceholder = true,
+                            collectionTileShape = itemCfg.collectionTileShape,
+                            collectionHideTitle = itemCfg.collectionHideTitle
+                        )
+                    }
+                } else {
+                    placeholderItems
+                }
+            } else {
+                placeholderItems
+            }
+
+            rows.add(
+                Category(
+                    id = if (isCollectionRailConfig(cfg)) {
+                        collectionRowId(cfg.collectionRailKeyOrGroup ?: return@forEach)
+                    } else {
+                        cfg.id
+                    },
+                    title = cfg.title,
+                    items = rowItems
+                )
+            )
+        }
+
+        return rows
+    }
+
+    /**
+     * Phase 1.2: Preload images into Coil's memory/disk cache
+     * Uses target display sizes to reduce decode overhead.
+     */
+    private fun preloadImagesWithCoil(urls: List<String>, width: Int, height: Int, batchLimit: Int = 0) {
+        // Bumped from 2/4 to 4/8 — enough to preload one full row of cards on
+        // the home screen. The old limits left the majority of visible cards
+        // without preloaded images on cold start.
+        val defaultLimit = if (isLowRamDevice) 4 else 8
+        val limit = if (batchLimit > 0) batchLimit else defaultLimit
+        val uniqueUrls = urls.filter { url ->
+            preloadedRequests.add("$url|${width}x${height}")
+        }.take(limit)
+        if (uniqueUrls.isEmpty()) return
+
+        uniqueUrls.forEach { url ->
+            val requestWidth = width.coerceAtLeast(1)
+            val requestHeight = height.coerceAtLeast(1)
+            val cacheKey = "$url|${requestWidth}x$requestHeight"
+            val request = ImageRequest.Builder(context)
+                .data(url)
+                .size(requestWidth, requestHeight)
+                .precision(Precision.INEXACT)
+                .allowHardware(true)
+                .memoryCacheKey(cacheKey)
+                .placeholderMemoryCacheKey(cacheKey)
+                .memoryCachePolicy(coil.request.CachePolicy.ENABLED)
+                .build()
+            imageLoader.enqueue(request)
+        }
+    }
+
+    private fun preloadLogoImages(urls: List<String>, batchLimit: Int = 0) {
+        preloadImagesWithCoil(urls, logoPreloadWidth, logoPreloadHeight, batchLimit)
+    }
+
+    private fun preloadBackdropImages(urls: List<String>) {
+        // Same TMDB size as the card, otherwise every image would be downloaded twice.
+        val sizedUrls = urls.map { url ->
+            TmdbImageSizing.forSlot(
+                url, backdropPreloadWidth, backdropPreloadHeight, TmdbImageSizing.Kind.BACKDROP
+            )
+        }
+        preloadImagesWithCoil(sizedUrls, backdropPreloadWidth, backdropPreloadHeight)
+    }
+
+    private fun scheduleIdleBackdropPreload(urls: List<String>) {
+        if (urls.isEmpty()) return
+        val requestedAt = lastFocusChangeTime
+        viewModelScope.launch(networkDispatcher) {
+            delay(BACKDROP_IDLE_PREFETCH_MS)
+            if (lastFocusChangeTime != requestedAt) return@launch
+            preloadBackdropImages(urls)
+        }
+    }
+
+    /**
+     * Called when Home resumes. Re-loads the catalog rows only once they are older than
+     * [HOME_DATA_STALE_AFTER_MS], so ordinary navigation back from Watchlist/TV/Search stays
+     * instant while a long-lived session still picks up new content.
+     *
+     * Startup owns the first load, so this stays out of its way until one has been started. It
+     * also retries when no load has ever succeeded: [lastHomeDataLoadAtMs] is set only once rows
+     * are published, so a failed load heals on the next resume instead of pinning Home to the
+     * cached rows for the whole TTL.
+     */
+    fun refreshHomeDataIfStale() {
+        if (!homeDataLoadAttempted) return
+        if (loadHomeJob?.isActive == true) return
+        val lastLoadAtMs = lastHomeDataLoadAtMs
+        if (lastLoadAtMs == 0L) {
+            android.util.Log.i("HomeViewModel", "no home load has succeeded yet — retrying on resume")
+            loadHomeData()
+            return
+        }
+        val ageMs = SystemClock.elapsedRealtime() - lastLoadAtMs
+        if (ageMs < HOME_DATA_STALE_AFTER_MS) return
+        android.util.Log.i("HomeViewModel", "home data ${ageMs / 60_000}min old — refreshing on resume")
+        loadHomeData()
+    }
+
+    fun refresh() {
+        loadHomeData()
+    }
+
+    private suspend fun resolveContinueWatchingItems(forceFresh: Boolean): List<ContinueWatchingItem> {
+        val isTraktAuthenticated = try {
+            traktRepository.isAuthenticated.first()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            false
+        }
+        // MDBList profiles have no Trakt token but still source CW from a remote provider —
+        // route them through the same getContinueWatching() path (it branches to MDBList).
+        val isAlternativeRemoteActive = try {
+            traktRepository.isAlternativeRemoteActive()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            false
+        }
+        val useRemoteSync = isTraktAuthenticated || isAlternativeRemoteActive
+        // Debug: write CW state to a file we can pull via adb
+        val items: List<ContinueWatchingItem> = if (useRemoteSync) {
+            // When connected to Trakt, use ONLY Trakt as the source of truth for
+            // Continue Watching. The previous code merged local/history items which
+            // polluted the CW row with shows not on the user's Trakt — e.g., items
+            // watched before connecting Trakt, or items from ARVIO Cloud watch_history
+            // that Trakt doesn't know about. Trakt users expect CW to match exactly
+            // what Trakt shows as "Up Next."
+            val traktItems = if (forceFresh) {
+                runCatching { traktRepository.getContinueWatching(forceRefresh = true) }.getOrDefault(emptyList())
+            } else {
+                val cached = traktRepository.getCachedContinueWatching()
+                if (cached.isNotEmpty()) cached else runCatching { traktRepository.getContinueWatching() }.getOrDefault(emptyList())
+            }
+
+            // Enrich Trakt items with local resume position data where available.
+            // This preserves exact playback position (e.g., "resume at 32:15") which
+            // Trakt's progress API doesn't provide — it only gives episode-level progress.
+            val localItems = runCatching { traktRepository.getLocalContinueWatching() }.getOrDefault(emptyList())
+            val historyItems = loadContinueWatchingFromHistory()
+            val localByKey = (localItems + historyItems).associateBy { "${it.mediaType}:${it.id}" }
+
+            traktItems.map { traktItem ->
+                val key = "${traktItem.mediaType}:${traktItem.id}"
+                val local = localByKey[key]
+                if (local != null && local.season == traktItem.season && local.episode == traktItem.episode) {
+                    // Same episode — enrich with local resume position
+                    traktItem.copy(
+                        resumePositionSeconds = maxOf(traktItem.resumePositionSeconds, local.resumePositionSeconds),
+                        durationSeconds = maxOf(traktItem.durationSeconds, local.durationSeconds),
+                        episodeTitle = traktItem.episodeTitle ?: local.episodeTitle,
+                        backdropPath = traktItem.backdropPath ?: local.backdropPath,
+                        posterPath = traktItem.posterPath ?: local.posterPath,
+                        totalEpisodes = if (traktItem.totalEpisodes > 0) traktItem.totalEpisodes else local.totalEpisodes,
+                        watchedEpisodes = if (traktItem.watchedEpisodes > 0) traktItem.watchedEpisodes else local.watchedEpisodes
+                    )
+                } else {
+                    traktItem
+                }
+            }
+        } else {
+            val historyItems = loadContinueWatchingFromHistory()
+            if (historyItems.isNotEmpty()) {
+                // Cloud watch_history is the shared source of truth for non-Trakt
+                // profiles. Only fall back to local CW when the cloud has nothing
+                // yet, so one device's stale local cache cannot override another
+                // device's synced progress/episode.
+                historyItems
+            } else {
+                runCatching { traktRepository.getLocalContinueWatching() }.getOrDefault(emptyList())
+            }
+        }
+
+        val sanitizedItems = sanitizeContinueWatchingItems(items)
+        return applyContinueWatchingDismissals(sanitizedItems)
+            // Don't filter by progress range for Trakt items — Trakt's progress API
+            // is authoritative. Some "up next" items have synthetic progress = 0
+            // (brand new season premiere, never started) which the old 1..99 filter
+            // was dropping. For non-Trakt items, keep the 1..99 filter to avoid
+            // showing completed (100%) or never-started (0%) items.
+            .filter { item ->
+                if (useRemoteSync) true else item.isUpNext || item.progress in 1..99
+            }
+            .take(Constants.MAX_CONTINUE_WATCHING)
+    }
+
+    /**
+     * Pull the full cloud state (addons, catalogs, settings, profiles) on ON_RESUME.
+     * This is the critical fix for the "addon added on phone but not on TV" symptom:
+     * when the TV comes back from background, the WebSocket may be dead, so we do
+     * an explicit pull to catch any account_sync_state changes that were missed.
+     * Throttled to at most once per 30 seconds to avoid excessive pulls on rapid
+     * activity transitions (e.g., player back → home → details → home).
+     */
+    @Volatile
+    private var lastCloudPullTimestamp = 0L
+    private val cloudPullThrottleMs = 30_000L
+    private var cloudPullJob: Job? = null
+
+    fun pullCloudStateOnResume() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (cloudPullJob?.isActive == true) return
+        if (lastCloudPullTimestamp != 0L && now - lastCloudPullTimestamp < cloudPullThrottleMs) return
+        lastCloudPullTimestamp = now
+        cloudPullJob = viewModelScope.launch(Dispatchers.IO) {
+            // Give the local Home/CW snapshots first access to IO and the main
+            // thread. Cloud payloads can exceed 1 MB and used to starve startup.
+            if (_uiState.value.categories.isEmpty() || isStartupSettling()) {
+                delayUntilStartupSettled(extraDelayMs = 750L)
+            }
+            // If a previous push failed (dirty flag), retry it now before pulling.
+            // This ensures the cloud has our latest state before we pull the other
+            // device's state on top of it — preventing stale overwrites.
+            if (cloudSyncRepository.isPushDirty) {
+                android.util.Log.i("HomeViewModel", "Retrying dirty push before pull")
+                try {
+                    cloudSyncRepository.pushToCloud()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                }
+            }
+            val result = runCatching {
+                cloudSyncRepository.pullFromCloud()
+            }
+            result.onSuccess { restoreResult ->
+                if (restoreResult == CloudSyncRepository.RestoreResult.RESTORED) {
+                    val profileId = profileManager.getProfileIdSync().ifBlank { "default" }
+                    if (activeRuntimeProfileId != null && activeRuntimeProfileId != profileId) {
+                        resetProfileRuntimeState(profileId)
+                    }
+                    // Cloud state was applied — reload home data so catalog changes,
+                    // addon changes, and settings from the other device take effect
+                    // immediately without waiting for the observeCatalogs flow.
+                    loadHomeData()
+                    refreshContinueWatchingOnly(force = true)
+                }
+            }.onFailure {
+                if (it is CancellationException) throw it
+                android.util.Log.w("HomeViewModel", "ON_RESUME cloud pull failed: ${it.message}")
+            }
+        }
+    }
+
+    fun refreshContinueWatchingOnly(force: Boolean = false) {
+        val ticket = continueWatchingRequests.claim(force) ?: return
+        refreshContinueWatchingJob = viewModelScope.launch {
+            try {
+                val now = SystemClock.elapsedRealtime()
+                val startCategories = _uiState.value.categories
+                val continueWatchingIndexAtStart = startCategories.indexOfFirst { it.id == "continue_watching" }
+                val existingContinueWatching = startCategories.getOrNull(continueWatchingIndexAtStart)
+                val hasPlaceholders = existingContinueWatching?.items?.any { it.isPlaceholder } == true
+
+                // Allow refresh if we have placeholders (need to replace them), otherwise throttle
+                if (!force && !hasPlaceholders && now - lastContinueWatchingUpdateMs < CONTINUE_WATCHING_REFRESH_MS) {
+                    return@launch
+                }
+
+                val localUpdateRevision = continueWatchingUpdates.revision
+                val trackingRevision = homeTrackingRevision
+                val resolvedContinueWatching = resolveContinueWatchingItemsStable(forceFresh = force)
+                if (continueWatchingUpdates.revision != localUpdateRevision || trackingRevision != homeTrackingRevision) return@launch
+
+                if (resolvedContinueWatching.isNotEmpty()) {
+                    withContext(Dispatchers.IO) {
+                        persistContinueWatchingCache(resolvedContinueWatching)
+                    }
+                    val mergedContinueWatching = mergeContinueWatchingResumeData(resolvedContinueWatching)
+                    val continueWatchingCategory = Category(
+                        id = "continue_watching",
+                        title = "Continue Watching",
+                        items = mergedContinueWatching.map { it.toMediaItem() }
+                    )
+                    continueWatchingCategory.items.forEach { mediaRepository.cacheItem(it) }
+                    lastContinueWatchingItems = continueWatchingCategory.items
+                    lastContinueWatchingUpdateMs = now
+                    val latestCategories = _uiState.value.categories.toMutableList()
+                    val continueWatchingIndex = latestCategories.indexOfFirst { it.id == "continue_watching" }
+                    if (continueWatchingIndex >= 0) {
+                        latestCategories[continueWatchingIndex] = continueWatchingCategory
+                    } else {
+                        latestCategories.add(0, continueWatchingCategory)
+                    }
+                    _uiState.value = _uiState.value.copy(categories = latestCategories)
+                    refreshWatchedBadges()
+                } else {
+                    if (force || remoteSyncManager.isRemoteConnected(TrackingFeature.CONTINUE_WATCHING)) {
+                        // A successful connected tracker read is authoritative, including empty.
+                        // Failed reads throw above and preserve the last good row instead.
+                        publishContinueWatching(emptyList())
+                        return@launch
+                    }
+                    // No new data from any source
+                    val latestCategories = _uiState.value.categories.toMutableList()
+                    val continueWatchingIndex = latestCategories.indexOfFirst { it.id == "continue_watching" }
+                    val latestHasPlaceholders = latestCategories
+                        .getOrNull(continueWatchingIndex)
+                        ?.items
+                        ?.any { it.isPlaceholder } == true
+                    if (hasPlaceholders) {
+                        // We had placeholders but no data loaded - remove the placeholder category
+                        if (continueWatchingIndex >= 0) {
+                            latestCategories.removeAt(continueWatchingIndex)
+                            _uiState.value = _uiState.value.copy(categories = latestCategories)
+                        }
+                    } else if (!latestHasPlaceholders && continueWatchingIndex >= 0) {
+                        // Continue Watching exists with real data - preserve it exactly as is
+                        return@launch
+                    } else if (lastContinueWatchingItems.isNotEmpty()) {
+                        // Only resurrect last-known CW items for non-Trakt profiles.
+                        // For Trakt profiles, if the fresh fetch returned empty, that
+                        // means the user genuinely has nothing to continue — don't
+                        // re-insert stale items that may include non-Trakt ghost data.
+                        val isTraktAuth = runCatching { traktRepository.isAuthenticated.first() }.getOrDefault(false)
+                        if (isTraktAuth) {
+                            return@launch // Trakt said empty — trust it
+                        }
+                        val persistedDismissedKeys = runCatching {
+                            traktRepository.getDismissedContinueWatchingShowKeys()
+                        }.getOrDefault(emptySet())
+                        val safeItems = lastContinueWatchingItems.filterNot { item ->
+                            val showKey = continueWatchingKey(item.mediaType, item.id)
+                            dismissedContinueWatchingAt.containsKey(showKey) || persistedDismissedKeys.contains(showKey)
+                        }
+                        if (safeItems.isEmpty()) {
+                            return@launch
+                        }
+                        val continueWatchingCategory = Category(
+                            id = "continue_watching",
+                            title = "Continue Watching",
+                            items = safeItems
+                        )
+                        latestCategories.add(0, continueWatchingCategory)
+                        _uiState.value = _uiState.value.copy(categories = latestCategories)
+                    }
+                    // Else: No data anywhere - nothing to show, UI already doesn't have it
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                // Silently fail - don't clear existing data on error
+                AppLogger.e("HomeVM", "launchContinueWatchingFetch failed", e)
+            } finally {
+                if (continueWatchingRequests.finish(ticket) && isActive) {
+                    refreshContinueWatchingOnly(force = true)
+                }
+            }
+        }
+    }
+
+    private suspend fun loadContinueWatchingFromHistory(): List<ContinueWatchingItem> {
+        return try {
+            val entries = watchHistoryRepository.getContinueWatching()
+            if (entries.isEmpty()) return emptyList()
+            val mapped = entries.distinctBy { entry ->
+                // Deduplicate at show level for TV — only keep the most recent episode per show.
+                // Entries are already sorted by updated_at desc, so distinctBy keeps the latest.
+                "${entry.media_type}:${entry.show_tmdb_id}"
+            }.mapNotNull { entry ->
+                val mediaType = if (entry.media_type == "tv") MediaType.TV else MediaType.MOVIE
+                val storedPct = (entry.progress * 100f).toInt()
+                val hasResumePosition = entry.position_seconds > 0L
+                val derivedPct = when {
+                    storedPct > 0 -> storedPct
+                    entry.duration_seconds > 0 && hasResumePosition ->
+                        ((entry.position_seconds.toFloat() / entry.duration_seconds.toFloat()) * 100f).toInt()
+                    hasResumePosition -> 1
+                    else -> 0
+                }
+                val resolvedTitle = entry.title
+                    ?.trim()
+                    ?.takeIf { it.isNotBlank() }
+                    ?: entry.episode_title
+                        ?.trim()
+                        ?.takeIf { it.isNotBlank() }
+                    ?: "Untitled"
+                ContinueWatchingItem(
+                    id = entry.show_tmdb_id,
+                    title = resolvedTitle,
+                    mediaType = mediaType,
+                    progress = derivedPct.coerceIn(0, 100),
+                    resumePositionSeconds = entry.position_seconds.coerceAtLeast(0L),
+                    durationSeconds = entry.duration_seconds.coerceAtLeast(0L),
+                    season = entry.season,
+                    episode = entry.episode,
+                    episodeTitle = entry.episode_title,
+                    backdropPath = entry.backdrop_path,
+                    posterPath = entry.poster_path
+                )
+            }
+            traktRepository.enrichContinueWatchingItems(mapped)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private suspend fun loadContinueWatchingFromHistoryStable(): List<ContinueWatchingItem> {
+        return try {
+            val entries = watchHistoryRepository.getContinueWatching()
+            if (entries.isEmpty()) return emptyList()
+            val mapped = entries.distinctBy { entry ->
+                "${entry.media_type}:${entry.show_tmdb_id}"
+            }.map(ContinueWatchingMerge::fromHistory)
+            traktRepository.enrichContinueWatchingItems(mapped)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private suspend fun resolveContinueWatchingItemsStable(forceFresh: Boolean): List<ContinueWatchingItem> {
+        val useRemoteSync = try {
+            remoteSyncManager.isRemoteConnected(TrackingFeature.CONTINUE_WATCHING)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            false
+        }
+        val items = if (useRemoteSync) {
+            val remoteItems = if (forceFresh) {
+                try {
+                    remoteSyncManager.getContinueWatching(forceRefresh = true)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (error: Exception) {
+                    AppLogger.recordException(
+                        throwable = error,
+                        context = mapOf(
+                            "error_area" to "ContinueWatching",
+                            "cw_phase" to "remote_fresh",
+                            "force_fresh" to forceFresh.toString()
+                        )
+                    )
+                    throw error
+                }
+            } else {
+                try {
+                    remoteSyncManager.getContinueWatching()
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (error: Exception) {
+                    AppLogger.recordException(
+                        throwable = error,
+                        context = mapOf(
+                            "error_area" to "ContinueWatching",
+                            "cw_phase" to "remote_cached_miss"
+                        )
+                    )
+                    throw error
+                }
+            }
+            val historyItems = loadContinueWatchingFromHistoryStable()
+            val localItems = loadSavedContinueWatchingSnapshot()
+            mergeTraktAndRecentLocalContinueWatching(
+                traktItems = remoteItems,
+                localItems = localItems,
+                historyItems = historyItems
+            )
+        } else {
+            val historyItems = loadContinueWatchingFromHistoryStable()
+            val localItems = loadSavedContinueWatchingSnapshot()
+            ContinueWatchingMerge.merge(historyItems.ifEmpty { localItems }, localItems, historyItems)
+        }
+
+        val repairedItems = repairContinueWatchingMetadataIfNeeded(items)
+        return applyContinueWatchingDismissals(sanitizeContinueWatchingItems(repairedItems))
+            .filter { item ->
+                if (useRemoteSync) true else item.isUpNext || item.progress in 1..99 || item.resumePositionSeconds > 0L
+            }
+            .take(Constants.MAX_CONTINUE_WATCHING)
+    }
+
+    private suspend fun preloadStartupContinueWatchingItems(): List<ContinueWatchingItem> {
+        // Startup must never wait for Trakt, Simkl, MDBList, or cloud traffic.
+        // This profile-scoped snapshot is updated after every successful remote
+        // resolution and gives every tracking provider the same instant path.
+        val localItems = loadSavedContinueWatchingSnapshot()
+        val diskItems = loadContinueWatchingCache()
+        val items = if (diskItems.isNotEmpty()) {
+            diskItems
+        } else {
+            val traktCache = try {
+                traktRepository.loadPersistedContinueWatchingForStartup()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
+            if (traktCache.isNotEmpty()) {
+                traktCache
+            } else {
+                localItems
+            }
+        }
+
+        val cachedItems = ContinueWatchingMerge.merge(items, localItems)
+        return applyContinueWatchingDismissals(sanitizeContinueWatchingItems(cachedItems, cacheOnly = true))
+            .filter { item ->
+                item.progress in 0..99 || item.resumePositionSeconds > 0L
+            }
+            .take(Constants.MAX_CONTINUE_WATCHING)
+    }
+
+    private suspend fun loadSavedContinueWatchingSnapshot(): List<ContinueWatchingItem> {
+        return try {
+            traktRepository.getLocalContinueWatchingSnapshot()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private suspend fun mergeContinueWatchingResumeData(
+        items: List<ContinueWatchingItem>
+    ): List<ContinueWatchingItem> {
+        if (items.isEmpty()) return emptyList()
+        return try {
+            val historyEntries = watchHistoryRepository.getContinueWatching()
+            if (historyEntries.isEmpty()) return items
+
+            val sortedHistory = historyEntries.sortedByDescending { it.updated_at ?: it.paused_at.orEmpty() }
+            val byExactKey = sortedHistory.associateBy { entry ->
+                "${entry.media_type}:${entry.show_tmdb_id}:${entry.season ?: -1}:${entry.episode ?: -1}"
+            }
+            val byShowKey = sortedHistory.associateBy { entry ->
+                "${entry.media_type}:${entry.show_tmdb_id}"
+            }
+
+            items.map { item ->
+                val mediaTypeKey = if (item.mediaType == MediaType.TV) "tv" else "movie"
+                val exactKey = "$mediaTypeKey:${item.id}:${item.season ?: -1}:${item.episode ?: -1}"
+                val showKey = "$mediaTypeKey:${item.id}"
+                // Only use exact episode-matched history, NOT show-level fallback.
+                // Show-level fallback caused old episode's position to leak to the next episode.
+                val match = byExactKey[exactKey]
+                if (match == null) {
+                    item
+                } else {
+                    val storedProgress = (match.progress * 100f).toInt()
+                    val derivedProgress = if (storedProgress <= 0 && match.duration_seconds > 0 && match.position_seconds > 0) {
+                        ((match.position_seconds.toFloat() / match.duration_seconds.toFloat()) * 100f).toInt()
+                    } else {
+                        storedProgress
+                    }
+                    item.copy(
+                        progress = derivedProgress.coerceIn(0, 100),
+                        resumePositionSeconds = match.position_seconds.coerceAtLeast(0L),
+                        durationSeconds = maxOf(item.durationSeconds, match.duration_seconds.coerceAtLeast(0L)),
+                        season = item.season ?: match.season,
+                        episode = item.episode ?: match.episode,
+                        episodeTitle = item.episodeTitle ?: match.episode_title
+                    )
+                }
+            }
+        } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+            items
+        }
+    }
+
+    /** Home resumed (e.g. back from Details): the watched history may have changed meanwhile. */
+    fun refreshWatchedBadgesOnResume() {
+        refreshWatchedBadges(force = true)
+    }
+
+    /**
+     * The long-press menu just marked a title: the watched cache already holds it, but the rows are
+     * the ones the last pass marked, so no pass would run before the next return to Home.
+     * `immediate` runs it now, past the throttle; `force` keeps a pass that freshly published rows
+     * restart (the next-episode branch refreshes Continue Watching) on the short delay.
+     */
+    private fun refreshWatchedBadgesAfterMark() {
+        refreshWatchedBadges(immediate = true, force = true)
+    }
+
+    private fun refreshWatchedBadges(immediate: Boolean = false, force: Boolean = false) {
+        val now = SystemClock.elapsedRealtime()
+        if (!immediate && watchedBadgesPassIsRedundant(
+                rows = _uiState.value.categories,
+                lastMarkedRows = lastWatchedBadgesCategories,
+                force = force,
+                sinceLastPassMs = now - lastWatchedBadgesRefreshMs,
+                throttleMs = WATCHED_BADGES_REFRESH_MS
+            )
+        ) return
+
+        // A resume pass stays quick even when rows published right after it restart the debounce.
+        val quick = force || (watchedBadgesQuickPending && watchedBadgesJob?.isActive == true)
+        watchedBadgesJob?.cancel()
+        watchedBadgesQuickPending = quick
+        val passDelayMs = watchedBadgesPassDelayMs(
+            quickRequested = quick,
+            hadPass = lastWatchedBadgesRefreshMs != 0L,
+            isLowRamDevice = isLowRamDevice
+        )
+        val profileId = profileManager.getProfileIdSync()
+        watchedBadgesJob = viewModelScope.launch {
+            if (!immediate) {
+                delay(passDelayMs)
+            }
+            try {
+                // Not gated on Trakt: the watched cache also holds local, Cloud, MDBList and
+                // SIMKL history, the same source Search, Discover and Details mark from.
+                withContext(networkDispatcher) {
+                    traktRepository.initializeWatchedCache()
+                }
+                if (_uiState.value.categories.isEmpty()) return@launch
+
+                val (watchedMovies, startedShows) = withContext(Dispatchers.Default) {
+                    val watchedMovies = traktRepository.getWatchedMoviesFromCache()
+                    // Index the history once instead of scanning it for every distinct show.
+                    val startedShows = startedShowIds(traktRepository.getWatchedEpisodesFromCache())
+                    watchedMovies to startedShows
+                }
+                if (profileManager.getProfileIdSync() != profileId) return@launch
+
+                // Install the lookup before notifying the Main-thread rows collector, which
+                // must never reapply the previous history to a newly marked state.
+                lastWatchedBadgesLookup = watchedMovies to startedShows
+                lastWatchedBadgesRefreshMs = SystemClock.elapsedRealtime()
+                val marked = _uiState.updateAndGet { it.withWatchedBadges(watchedMovies, startedShows) }
+                lastWatchedBadgesCategories = marked.categories
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                AppLogger.e("HomeVM", "refreshWatchedBadges failed: ${e.message}", e)
+            }
+        }
+    }
+
+    /**
+     * Phase 1.4 & 6.1 & 6.2-6.3: Update hero with adaptive debouncing
+     * Uses fast-scroll detection for smoother experience during rapid navigation
+     */
+    fun updateHeroVisualItemImmediately(item: MediaItem) {
+        if (isCollectionItem(item)) {
+            updateHeroItem(item)
+            return
+        }
+        if (!isActionableMediaItem(item)) return
+
+        val cacheKey = "${item.mediaType}_${item.id}"
+        heroUpdateJob?.cancel()
+        heroDetailsJob?.cancel()
+        performHeroUpdate(item, getCachedLogo(cacheKey))
+        scheduleHeroDetailsFetch(item, fastScrolling = true)
+    }
+
+    fun updateHeroItem(item: MediaItem) {
+        if (isCollectionItem(item)) {
+            if (item.isPlaceholder) return
+            heroUpdateJob?.cancel()
+            heroDetailsJob?.cancel()
+            val catalog = collectionCatalogByMediaId[item.id]
+            val collectionLogo = catalog?.collectionClearLogoUrl?.takeIf { it.isNotBlank() }
+            // Prefer the high-res static hero art for the backdrop so the
+            // hero area reads as a cinematic still rather than a looping GIF.
+            val heroBackdrop = catalog?.collectionHeroImageUrl?.takeIf { it.isNotBlank() }
+                ?: item.backdrop
+            val heroItem = if (heroBackdrop != null && heroBackdrop != item.backdrop) {
+                item.copy(backdrop = heroBackdrop)
+            } else item
+            _uiState.value = _uiState.value.copy(
+                previousHeroItem = _uiState.value.heroItem,
+                previousHeroLogoUrl = _uiState.value.heroLogoUrl,
+                heroItem = heroItem,
+                heroLogoUrl = collectionLogo,
+                heroOverviewOverride = item.overview,
+                heroTrailerKey = null,
+                isHeroTransitioning = false
+            )
+            return
+        }
+        if (!isActionableMediaItem(item)) {
+            return
+        }
+
+        val cacheKey = "${item.mediaType}_${item.id}"
+        val cachedLogo = getCachedLogo(cacheKey)
+
+        // Phase 6.2-6.3: Detect fast scrolling
+        val currentTime = System.currentTimeMillis()
+        val timeSinceLastChange = currentTime - lastFocusChangeTime
+        lastFocusChangeTime = currentTime
+
+        val isFastScrolling = timeSinceLastChange < FAST_SCROLL_THRESHOLD_MS
+        if (isFastScrolling) {
+            consecutiveFastChanges++
+        } else {
+            consecutiveFastChanges = 0
+        }
+
+        // Adaptive debounce: higher during fast scroll sequences
+        val debounceMs = when {
+            consecutiveFastChanges > 3 -> FAST_SCROLL_DEBOUNCE_MS  // Very fast scroll
+            consecutiveFastChanges > 1 -> HERO_DEBOUNCE_MS + 50    // Moderate fast scroll
+            cachedLogo != null -> 0L  // Cached = instant
+            else -> HERO_DEBOUNCE_MS  // Normal debounce
+        }
+
+        // Phase 1.4: If logo is cached and not fast-scrolling, update immediately
+        val fastScrolling = consecutiveFastChanges > 1
+        if (cachedLogo != null && !fastScrolling) {
+            heroUpdateJob?.cancel()
+            performHeroUpdate(item, cachedLogo)
+            scheduleHeroDetailsFetch(item, fastScrolling)
+            return
+        }
+
+        // Phase 6.1 + 6.2-6.3: Adaptive debounce
+        heroUpdateJob?.cancel()
+        heroDetailsJob?.cancel()
+        heroUpdateJob = viewModelScope.launch {
+            if (debounceMs > 0) {
+                delay(debounceMs)
+            }
+
+            // Check if still the current focus after debounce
+            val currentCachedLogo = getCachedLogo(cacheKey)
+            performHeroUpdate(item, currentCachedLogo)
+            scheduleHeroDetailsFetch(item, fastScrolling)
+
+            // Fetch logo async if not cached (skip IPTV — uses channel logo directly)
+            if (currentCachedLogo == null && isActionableMediaItem(item) && !isIptvItem(item)) {
+                try {
+                    // Issue 1: hero logo fetch yields to Details IMMEDIATE traffic. Once
+                    // startup has settled it no longer queues behind the single-slot
+                    // card-logo fan-out; before that the initial rows keep DEFERRED.
+                    val heroLogoPriority =
+                        if (isStartupSettling()) Priority.BACKGROUND else Priority.DEFERRED
+                    val logoUrl = tmdbPriorityDispatcher.withPermit(heroLogoPriority) {
+                        withContext(networkDispatcher) {
+                            mediaRepository.getLogoUrl(item.mediaType, item.id)
+                        }
+                    }
+                    if (logoUrl != null && _uiState.value.heroItem?.id == item.id) {
+                        putCachedLogo(cacheKey, logoUrl)
+                        _uiState.value = _uiState.value.copy(
+                            heroLogoUrl = logoUrl,
+                            isHeroTransitioning = false
+                        )
+                        scheduleLogoCachePublish()
+                        // Preload the logo image
+                        preloadLogoImages(listOf(logoUrl))
+                    }
+                } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                    // Logo fetch failed
+                    AppLogger.e("HomeVM", "Hero logo fetch failed", e)
+                }
+            }
+        }
+    }
+
+    private fun performHeroUpdate(item: MediaItem, logoUrl: String?) {
+        val currentState = _uiState.value
+        val currentHero = currentState.heroItem
+        val cachedDetails = getCachedHeroDetailsSnapshot(item)
+        val heroItem = cachedDetails?.let { item.withHeroDetails(it) } ?: item
+        if (currentHero?.id == item.id &&
+            currentHero.mediaType == item.mediaType &&
+            currentState.heroLogoUrl == logoUrl &&
+            !currentState.isHeroTransitioning
+        ) {
+            if (cachedDetails != null) {
+                applyHeroDetailsSnapshotIfCurrent(item, cachedDetails)
+            }
+            return
+        }
+
+        if (!currentHero.isSameHomeHero(item)) {
+            heroTrailerJob?.cancel()
+            heroTrailerRequestKey = null
+        }
+        // Save previous hero for crossfade animation, clear trailer for new hero
+        _uiState.value = currentState.copy(
+            previousHeroItem = currentState.heroItem,
+            previousHeroLogoUrl = currentState.heroLogoUrl,
+            heroItem = heroItem,
+            heroLogoUrl = logoUrl,
+            heroOverviewOverride = cachedDetails?.overview?.ifBlank { heroItem.overview },
+            heroTrailerKey = if (currentHero.isSameHomeHero(item)) currentState.heroTrailerKey else null,
+            isHeroTransitioning = true
+        )
+    }
+
+    private fun requestHeroTrailer(item: MediaItem) {
+        val state = _uiState.value
+        if (!state.trailerAutoPlay || !state.heroItem.isSameHomeHero(item) ||
+            !isActionableMediaItem(item) || isIptvItem(item) || isCollectionItem(item)
+        ) return
+        if (state.heroTrailerKey != null) return
+        val language = mediaRepository.contentLanguage
+        val requestKey = "$language:${item.mediaType}:${item.id}"
+        heroTrailerCache.get(requestKey)?.let { cached ->
+            // A transient metadata failure must not disable this title's preview
+            // for the rest of the app session. Successful keys stay in the LRU.
+            if (cached.key != null || SystemClock.elapsedRealtime() - cached.cachedAt < 60_000L) {
+                _uiState.value = _uiState.value.copy(heroTrailerKey = cached.key)
+                cached.key?.let(::prefetchTrailerUrl)
+                return
+            }
+        }
+        if (heroTrailerRequestKey == requestKey && heroTrailerJob?.isActive == true) return
+        heroTrailerJob?.cancel()
+        heroTrailerRequestKey = requestKey
+        heroTrailerJob = viewModelScope.launch {
+            delay(220L)
+            val trailerKey = withContext(networkDispatcher) {
+                mediaRepository.getTrailerKey(item.mediaType, item.id)
+            }
+            heroTrailerCache.put(requestKey, CachedHomeTrailer(trailerKey))
+            val current = _uiState.value
+            if (current.trailerAutoPlay && current.heroItem.isSameHomeHero(item) &&
+                mediaRepository.contentLanguage == language && heroTrailerRequestKey == requestKey
+            ) {
+                _uiState.value = current.copy(heroTrailerKey = trailerKey)
+                trailerKey?.let(::prefetchTrailerUrl)
+            }
+        }
+    }
+
+    private fun hydrateHeroDetailsIfNeeded(item: MediaItem) {
+        if (!_uiState.value.heroItem.isSameHomeHero(item)) return
+        if (!isActionableMediaItem(item) || isIptvItem(item) || isCollectionItem(item)) {
+            return
+        }
+
+        requestHeroTrailer(item)
+
+        val normalizedOverview = item.overview.trim()
+        val looksTruncated = normalizedOverview.endsWith("...") || normalizedOverview.length < 120
+        if (
+            normalizedOverview.isNotBlank() &&
+            !looksTruncated &&
+            item.duration.isNotBlank() &&
+            item.duration != "0m" &&
+            item.imdbRating.isNotBlank() &&
+            item.primaryNetworkLogo != null
+        ) {
+            return
+        }
+
+        heroDetailsJob?.cancel()
+        heroDetailsJob = viewModelScope.launch(networkDispatcher) {
+            try {
+                val snapshot = loadHeroDetailsSnapshot(item) ?: return@launch
+                heroDetailsCache[heroDetailsKey(item)] = snapshot
+                applyHeroDetailsSnapshotIfCurrent(item, snapshot)
+                snapshot.primaryNetworkLogo?.let { preloadLogoImages(listOf(it)) }
+
+                    } catch (e: Exception) {
+                if (e is CancellationException) throw e
+            }
+        }
+    }
+
+    private fun prefetchTrailerUrl(trailerKey: String) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                youTubeExtractor.extractPlaybackSource("https://www.youtube.com/watch?v=$trailerKey")
+            }
+        }
+    }
+
+    private fun scheduleHeroDetailsFetch(item: MediaItem, fastScrolling: Boolean) {
+        heroDetailsJob?.cancel()
+
+        requestHeroTrailer(item)
+
+        heroDetailsJob = viewModelScope.launch(networkDispatcher) {
+            val detailsKey = heroDetailsKey(item)
+            val cachedDetails = getCachedHeroDetailsSnapshot(item)
+            if (cachedDetails != null) {
+                applyHeroDetailsSnapshotIfCurrent(item, cachedDetails)
+                if (cachedDetails.fullyLoaded) return@launch
+            }
+
+            val currentHero = _uiState.value.heroItem
+            if (currentHero?.id != item.id) return@launch
+
+            try {
+                val snapshot = loadHeroDetailsSnapshot(item) ?: return@launch
+                heroDetailsCache[detailsKey] = snapshot
+                applyHeroDetailsSnapshotIfCurrent(item, snapshot)
+                snapshot.primaryNetworkLogo?.let { preloadLogoImages(listOf(it)) }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _uiState.value = _uiState.value.copy(isHeroTransitioning = false)
+            }
+        }
+    }
+
+    /**
+     * Phase 1.3: Ahead-of-focus preloading
+     * Call this when focus changes to preload nearby items
+     */
+    private suspend fun prefetchHeroDetailsForFocusWindow(items: List<MediaItem>) {
+        val itemsToLoad = items
+            .asSequence()
+            .filter { item -> !isIptvItem(item) && !isCollectionItem(item) }
+            .filter { item -> getCachedHeroDetailsSnapshot(item)?.fullyLoaded != true }
+            .filter { item -> heroDetailsFetchInFlight.add(heroDetailsKey(item)) }
+            .take(if (isLowRamDevice) 2 else 4)
+            .toList()
+
+        if (itemsToLoad.isEmpty()) return
+
+        val providerLogoUrls = coroutineScope {
+            itemsToLoad.map { item ->
+                async(networkDispatcher) {
+                    val key = heroDetailsKey(item)
+                    try {
+                        heroDetailsPrefetchSemaphore.withPermit {
+                            // Issue 1: hero decoration also draws from the shared
+                            // BACKGROUND budget (TMDB details + provider logo).
+                            tmdbPriorityDispatcher.withPermit(Priority.BACKGROUND) {
+                                loadHeroDetailsSnapshot(item)
+                            }?.let { snapshot ->
+                                heroDetailsCache[key] = snapshot
+                                snapshot.primaryNetworkLogo
+                            }
+                        }
+                    } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                        null
+                    } finally {
+                        heroDetailsFetchInFlight.remove(key)
+                    }
+                }
+            }.awaitAll().filterNotNull()
+        }
+
+        if (providerLogoUrls.isNotEmpty()) {
+            preloadLogoImages(providerLogoUrls)
+        }
+    }
+
+    fun onFocusChanged(rowIndex: Int, itemIndex: Int, shouldPrefetch: Boolean = true, visibleCategory: Category? = null) {
+        currentRowIndex = rowIndex
+        currentItemIndex = itemIndex
+        lastFocusChangeTime = System.currentTimeMillis()
+        if ((visibleCategory ?: _uiState.value.categories.getOrNull(rowIndex))?.id == FAVORITE_TV_CATEGORY_ID) {
+            refreshFavoriteTvGuideOnFocus()
+        }
+        if (!shouldPrefetch) {
+            prefetchJob?.cancel()
+            return
+        }
+
+        prefetchJob?.cancel()
+        prefetchJob = viewModelScope.launch(networkDispatcher) {
+            delay(FOCUS_PREFETCH_COALESCE_MS)
+
+            val category = visibleCategory ?: _uiState.value.categories.getOrNull(rowIndex) ?: return@launch
+
+            if (category.items.isEmpty()) return@launch
+            if (category.id.startsWith("collection_row_")) return@launch
+
+            // Ensure focused card + next 4 cards get logo priority.
+            val startIndex = itemIndex.coerceIn(0, category.items.lastIndex)
+            val endIndex = minOf(itemIndex + 4, category.items.lastIndex)
+            if (startIndex > endIndex) return@launch
+
+            val focusWindowItems = (startIndex..endIndex)
+                .mapNotNull { category.items.getOrNull(it) }
+                .filter { isActionableMediaItem(it) }
+
+            val itemsToLoad = focusWindowItems.filter { item ->
+                val key = "${item.mediaType}_${item.id}"
+                !hasCachedLogo(key) && logoFetchInFlight.add(key)
+            }
+
+            if (itemsToLoad.isNotEmpty()) {
+                // Fetch logos for focused window
+                val logoJobs = itemsToLoad.map { item ->
+                    async(networkDispatcher) {
+                        val key = "${item.mediaType}_${item.id}"
+                        try {
+                            // Issue 1: logo decoration trickles through BACKGROUND.
+                            val logoUrl = tmdbPriorityDispatcher.withPermit(Priority.BACKGROUND) {
+                                mediaRepository.getLogoUrl(item.mediaType, item.id)
+                            }
+                            if (logoUrl != null) key to logoUrl else null
+                        } catch (e: Exception) {
+                if (e is CancellationException) throw e
+
+                            null
+                        } finally {
+                            logoFetchInFlight.remove(key)
+                        }
+                    }
+                }
+                val newLogos = logoJobs.awaitAll().filterNotNull().toMap()
+
+                if (newLogos.isNotEmpty()) {
+                    if (putCachedLogos(newLogos)) {
+                        scheduleLogoCachePublish(highPriority = true)
+                    }
+                    // Preload actual images
+                    preloadLogoImages(newLogos.values.toList())
+                }
+            }
+
+            // IMDb ratings and service/provider logos live in the hero metadata,
+            // not the card-logo cache. Warm the focused item and nearby cards so
+            // moving focus can render those fields from memory.
+            prefetchHeroDetailsForFocusWindow(focusWindowItems)
+
+            // Keep extra backdrop decoding off the active DPAD path; focused
+            // cards still request their own images while warmup waits for idle.
+            val backdropUrls = focusWindowItems
+                .take(incrementalBackdropPrefetchItems + 1)
+                .mapNotNull { it.backdrop ?: it.image }
+            scheduleIdleBackdropPreload(backdropUrls)
+        }
+    }
+
+    /**
+     * Phase 1.1: Preload logos for category + next 2 categories
+     */
+    fun preloadLogosForCategory(categoryIndex: Int, prioritizeVisible: Boolean = false, visibleCategory: Category? = null) {
+        if (prioritizeVisible) {
+            preloadCategoryPriorityJob?.cancel()
+        } else {
+            preloadCategoryJobs.remove(categoryIndex)?.cancel()
+        }
+        val targetJob = viewModelScope.launch(networkDispatcher) {
+            try {
+                delay(
+                    if (prioritizeVisible) {
+                        if (isLowRamDevice) 60L else 30L
+                    } else {
+                        if (isLowRamDevice) 200L else 100L
+                    }
+                )
+                val category = visibleCategory ?: _uiState.value.categories.getOrNull(categoryIndex) ?: return@launch
+                if (category.id.startsWith("collection_row_")) return@launch
+                val maxLogoItems = if (prioritizeVisible) prioritizedLogoPrefetchItems else incrementalLogoPrefetchItems
+
+                val itemsToLoad = category.items.take(maxLogoItems).filter { item ->
+                    if (!isActionableMediaItem(item)) return@filter false
+                    if (isIptvItem(item)) return@filter false  // IPTV items use channel logo directly
+                    val key = "${item.mediaType}_${item.id}"
+                    !hasCachedLogo(key) && logoFetchInFlight.add(key)
+                }
+
+                if (itemsToLoad.isNotEmpty()) {
+                    val logoJobs = itemsToLoad.map { item ->
+                        async(networkDispatcher) {
+                            val key = "${item.mediaType}_${item.id}"
+                            try {
+                                // Issue 1: logo decoration trickles through BACKGROUND.
+                                val logoUrl = tmdbPriorityDispatcher.withPermit(Priority.BACKGROUND) {
+                                    mediaRepository.getLogoUrl(item.mediaType, item.id)
+                                }
+                                if (logoUrl != null) key to logoUrl else null
+                            } catch (e: Exception) {
+                                if (e is CancellationException) throw e
+                                null
+                            } finally {
+                                logoFetchInFlight.remove(key)
+                            }
+                        }
+                    }
+                    val newLogos = logoJobs.awaitAll().filterNotNull().toMap()
+                    if (newLogos.isNotEmpty()) {
+                        if (putCachedLogos(newLogos)) {
+                            scheduleLogoCachePublish(highPriority = prioritizeVisible)
+                        }
+                        // Preload actual images
+                        preloadLogoImages(newLogos.values.toList())
+                    }
+                }
+
+                val backdropItems = if (prioritizeVisible) {
+                    incrementalBackdropPrefetchItems + 1
+                } else {
+                    incrementalBackdropPrefetchItems
+                }
+                val backdropUrls = category.items.take(backdropItems).mapNotNull { it.backdrop ?: it.image }
+                scheduleIdleBackdropPreload(backdropUrls)
+            } finally {
+                if (!prioritizeVisible) {
+                    preloadCategoryJobs.remove(categoryIndex)
+                }
+            }
+        }
+        if (prioritizeVisible) {
+            preloadCategoryPriorityJob = targetJob
+        } else {
+            preloadCategoryJobs[categoryIndex] = targetJob
+        }
+    }
+
+    /**
+     * Clear hero transition state after animation completes
+     */
+    fun onHeroTransitionComplete() {
+        _uiState.value = _uiState.value.copy(
+            previousHeroItem = null,
+            previousHeroLogoUrl = null,
+            isHeroTransitioning = false
+        )
+    }
+
+    fun toggleWatchlist(item: MediaItem) {
+        viewModelScope.launch {
+            try {
+                val isInWatchlist = watchlistRepository.isInWatchlist(item.mediaType, item.id)
+                val remoteConnected = try {
+                    remoteSyncManager.isRemoteConnected()
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    false
+                }
+                val isAnime = item.mediaType == MediaType.TV &&
+                    item.originalLanguage.equals("ja", ignoreCase = true) &&
+                    item.genreIds.contains(16)
+                if (isInWatchlist) {
+                    if (remoteConnected && !remoteSyncManager.removeFromWatchlist(item.mediaType, item.id, isAnime)) {
+                        throw IllegalStateException("Failed to remove from remote watchlist")
+                    }
+                    watchlistRepository.removeFromWatchlist(item.mediaType, item.id)
+                } else {
+                    if (remoteConnected && !remoteSyncManager.addToWatchlist(item.mediaType, item.id, isAnime)) {
+                        throw IllegalStateException("Failed to add to remote watchlist")
+                    }
+                    watchlistRepository.addToWatchlist(item.mediaType, item.id, item)
+                }
+                // Confirm before the cloud push, which can take several seconds.
+                _uiState.value = _uiState.value.copy(
+                    toastMessage = if (isInWatchlist) context.getString(R.string.watchlist_toast_removed) else context.getString(R.string.added_to_watchlist),
+                    toastType = ToastType.SUCCESS
+                )
+                runCatching { cloudSyncRepository.pushToCloud() }
+                    .onFailure { error ->
+                        AppLogger.recordException(
+                            throwable = error,
+                            context = mapOf(
+                                "error_area" to "Watchlist",
+                                "watchlist_phase" to "home_toggle_cloud_push",
+                                "media_type" to item.mediaType.name.lowercase(),
+                                "trakt_connected" to remoteConnected.toString()
+                            )
+                        )
+                    }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                AppLogger.recordException(
+                    throwable = e,
+                    context = mapOf(
+                        "error_area" to "Watchlist",
+                        "watchlist_phase" to "home_toggle",
+                        "media_type" to item.mediaType.name.lowercase()
+                    )
+                )
+                _uiState.value = _uiState.value.copy(
+                    toastMessage = context.getString(R.string.details_failed_update_watchlist),
+                    toastType = ToastType.ERROR
+                )
+            }
+        }
+    }
+
+    private suspend fun persistFollowingEpisodePointer(
+        item: MediaItem,
+        watchedSeason: Int,
+        watchedEpisode: Int,
+    ) {
+        val currentSeasonEpisodes = mediaRepository.getSeasonEpisodes(item.id, watchedSeason)
+            .orEmpty()
+            .sortedBy { it.episodeNumber }
+        if (currentSeasonEpisodes.isEmpty()) return
+        val followingEpisode = currentSeasonEpisodes.firstOrNull {
+            it.episodeNumber > watchedEpisode
+        } ?: mediaRepository.getSeasonEpisodes(item.id, watchedSeason + 1)
+            .orEmpty()
+            .sortedBy { it.episodeNumber }
+            .firstOrNull()
+            ?: return
+
+        val hasAired = EpisodeAvailability.hasAired(followingEpisode.airDate)
+        traktRepository.saveLocalContinueWatching(
+            mediaType = MediaType.TV,
+            tmdbId = item.id,
+            title = item.title,
+            posterPath = item.image,
+            backdropPath = item.backdrop,
+            season = followingEpisode.tmdbSeasonNumber,
+            episode = followingEpisode.tmdbEpisodeNumber,
+            displaySeason = followingEpisode.seasonNumber,
+            displayEpisode = followingEpisode.episodeNumber,
+            episodeTitle = followingEpisode.name,
+            progress = 0,
+            positionSeconds = 0L,
+            durationSeconds = 0L,
+            year = item.year,
+            isUpNext = true,
+            episodeAirDate = followingEpisode.airDate.orEmpty(),
+            emitUpdate = hasAired,
+        )
+    }
+
+    fun toggleWatched(item: MediaItem) {
+        viewModelScope.launch {
+            try {
+                if (item.mediaType == MediaType.MOVIE) {
+                    if (item.isWatched) {
+                        traktRepository.markMovieUnwatched(item.id)
+                        refreshWatchedBadgesAfterMark()
+                        _uiState.value = _uiState.value.copy(
+                            toastMessage = context.getString(R.string.details_marked_unwatched),
+                            toastType = ToastType.SUCCESS
+                        )
+                    } else {
+                        traktRepository.markMovieWatched(item.id)
+                        refreshWatchedBadgesAfterMark()
+                        watchHistoryRepository.removeFromHistory(item.id, null, null)
+                        _uiState.value = _uiState.value.copy(
+                            toastMessage = context.getString(R.string.details_marked_watched),
+                            toastType = ToastType.SUCCESS
+                        )
+                    }
+                } else {
+                    val nextEp = item.nextEpisode
+                    if (nextEp != null) {
+                        // OPTIMISTIC UI UPDATE: Remove from CW and show toast immediately
+                        val updatedCategories = _uiState.value.categories.map { category ->
+                            if (category.id == "continue_watching") {
+                                category.copy(items = category.items.filter { it.id != item.id })
+                            } else {
+                                category
+                            }
+                        }.filter { category ->
+                            category.id != "continue_watching" || category.items.isNotEmpty()
+                        }
+
+                        _uiState.value = _uiState.value.copy(
+                            categories = updatedCategories,
+                            toastMessage = context.getString(R.string.details_episode_marked_watched, nextEp.seasonNumber, nextEp.episodeNumber),
+                            toastType = ToastType.SUCCESS
+                        )
+
+                        // Sync to backend after UI update (these may be slow for non-Trakt/non-Cloud profiles)
+                        traktRepository.markEpisodeWatched(item.id, nextEp.seasonNumber, nextEp.episodeNumber)
+                        refreshWatchedBadgesAfterMark()
+                        watchHistoryRepository.removeFromHistory(item.id, nextEp.seasonNumber, nextEp.episodeNumber)
+
+                        try {
+                            persistFollowingEpisodePointer(
+                                item = item,
+                                watchedSeason = nextEp.seasonNumber,
+                                watchedEpisode = nextEp.episodeNumber,
+                            )
+                            lastContinueWatchingUpdateMs = 0L
+                            refreshContinueWatchingOnly(force = true)
+                                } catch (e: Exception) {
+                if (e is CancellationException) throw e
+            }
+                    } else {
+                        _uiState.value = _uiState.value.copy(
+                            toastMessage = context.getString(R.string.home_no_episode_info),
+                            toastType = ToastType.ERROR
+                        )
+                    }
+                }
+                try {
+                    launcherContinueWatchingRepository.refreshForCurrentProfile()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                }
+                // Push cloud snapshot so other devices see the watched-status change
+                // and the updated Continue Watching entry. Without this, the snapshot
+                // (localCW, localWatchedMovies, localWatchedEpisodes, dismissedCW)
+                // was never updated — only the Supabase watch_history table was.
+                try {
+                    cloudSyncRepository.pushToCloud()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _uiState.value = _uiState.value.copy(
+                    toastMessage = context.getString(R.string.details_failed_update_watched),
+                    toastType = ToastType.ERROR
+                )
+            }
+        }
+    }
+
+    fun markWatched(item: MediaItem) {
+        viewModelScope.launch {
+            try {
+                if (item.mediaType == MediaType.MOVIE) {
+                    if (!item.isWatched) {
+                        traktRepository.markMovieWatched(item.id)
+                        watchHistoryRepository.removeFromHistory(item.id, null, null)
+                        _uiState.value = _uiState.value.copy(
+                            toastMessage = context.getString(R.string.details_marked_watched),
+                            toastType = ToastType.SUCCESS
+                        )
+                    } else {
+                        _uiState.value = _uiState.value.copy(
+                            toastMessage = context.getString(R.string.home_already_watched),
+                            toastType = ToastType.INFO
+                        )
+                    }
+                } else {
+                    val nextEp = item.nextEpisode
+                    if (nextEp != null) {
+                        // OPTIMISTIC UI UPDATE: Remove from CW and show toast immediately
+                        val updatedCategories = _uiState.value.categories.map { category ->
+                            if (category.id == "continue_watching") {
+                                category.copy(items = category.items.filter { it.id != item.id })
+                            } else {
+                                category
+                            }
+                        }.filter { category ->
+                            category.id != "continue_watching" || category.items.isNotEmpty()
+                        }
+
+                        _uiState.value = _uiState.value.copy(
+                            categories = updatedCategories,
+                            toastMessage = context.getString(R.string.details_episode_marked_watched, nextEp.seasonNumber, nextEp.episodeNumber),
+                            toastType = ToastType.SUCCESS
+                        )
+
+                        // Sync to backend after UI update (these may be slow for non-Trakt/non-Cloud profiles)
+                        try {
+                            traktRepository.markEpisodeWatched(item.id, nextEp.seasonNumber, nextEp.episodeNumber)
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                        }
+                        try {
+                            watchHistoryRepository.removeFromHistory(item.id, nextEp.seasonNumber, nextEp.episodeNumber)
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                        }
+
+                        try {
+                            persistFollowingEpisodePointer(
+                                item = item,
+                                watchedSeason = nextEp.seasonNumber,
+                                watchedEpisode = nextEp.episodeNumber,
+                            )
+                            // Reset throttle so refresh actually runs
+                            lastContinueWatchingUpdateMs = 0L
+                            refreshContinueWatchingOnly(force = true)
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                        }
+                    } else {
+                        _uiState.value = _uiState.value.copy(
+                            toastMessage = context.getString(R.string.home_no_episode_info),
+                            toastType = ToastType.ERROR
+                        )
+                    }
+                }
+                try {
+                    launcherContinueWatchingRepository.refreshForCurrentProfile()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                }
+                // Push cloud snapshot so other devices see watched status + CW update
+                try {
+                    cloudSyncRepository.pushToCloud()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _uiState.value = _uiState.value.copy(
+                    toastMessage = context.getString(R.string.details_failed_update_watched),
+                    toastType = ToastType.ERROR
+                )
+            }
+        }
+    }
+
+    fun dismissToast() {
+        _uiState.value = _uiState.value.copy(toastMessage = null)
+    }
+
+    suspend fun isInWatchlist(item: MediaItem): Boolean {
+        return watchlistRepository.isInWatchlist(item.mediaType, item.id)
+    }
+
+    fun removeFromContinueWatching(item: MediaItem) {
+        viewModelScope.launch {
+            try {
+                val season = if (item.mediaType == MediaType.TV) item.nextEpisode?.seasonNumber else null
+                val episode = if (item.mediaType == MediaType.TV) item.nextEpisode?.episodeNumber else null
+                dismissedContinueWatchingAt[continueWatchingKey(item.mediaType, item.id)] = System.currentTimeMillis()
+
+                watchHistoryRepository.removeFromHistory(item.id, season, episode)
+                remoteSyncManager.dismissContinueWatching(item.mediaType, item.id, season, episode)
+                traktRepository.removeFromContinueWatchingCache(item.id, null, null, item.mediaType)
+                traktRepository.dismissContinueWatching(item)
+                try {
+                    cloudSyncRepository.pushToCloud()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                }
+
+                val updatedCategories = _uiState.value.categories.map { category ->
+                    if (category.id == "continue_watching") {
+                        category.copy(items = category.items.filter { it.id != item.id })
+                    } else {
+                        category
+                    }
+                }.filter { category ->
+                    category.id != "continue_watching" || category.items.isNotEmpty()
+                }
+
+                _uiState.value = _uiState.value.copy(
+                    categories = updatedCategories,
+                    toastMessage = context.getString(R.string.home_removed_continue_watching),
+                    toastType = ToastType.SUCCESS
+                )
+                try {
+                    launcherContinueWatchingRepository.refreshForCurrentProfile()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                }
+                updatedCategories.firstOrNull { it.id == "continue_watching" }?.let { category ->
+                    lastContinueWatchingItems = category.items
+                    lastContinueWatchingUpdateMs = SystemClock.elapsedRealtime()
+                } ?: run {
+                    lastContinueWatchingItems = emptyList()
+                    lastContinueWatchingUpdateMs = SystemClock.elapsedRealtime()
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _uiState.value = _uiState.value.copy(
+                    toastMessage = context.getString(R.string.home_failed_remove_continue_watching),
+                    toastType = ToastType.ERROR
+                )
+            }
+        }
+    }
+
+    // --- App Update Methods ---
+
+    fun checkForAppUpdates(silent: Boolean = false) {
+        if (!appUpdateRepository.supportsSelfUpdate()) return
+
+        viewModelScope.launch {
+            if (!silent) {
+                updateStatusManager.updateStatus(com.arflix.tv.updater.UpdateStatus.Checking)
+            }
+
+            val result = appUpdateRepository.getLatestUpdate()
+            result.onSuccess { update ->
+                val localVer = appUpdateRepository.getInstalledVersionName()
+                val isNewer = com.arflix.tv.updater.VersionUtils.isRemoteNewer(update.tag, localVer)
+
+                if (isNewer) {
+                    updateStatusManager.updateStatus(com.arflix.tv.updater.UpdateStatus.UpdateAvailable(update))
+                } else {
+                    if (!silent) {
+                        _uiState.value = _uiState.value.copy(
+                            toastMessage = context.getString(R.string.update_already_latest),
+                            toastType = ToastType.INFO
+                        )
+                    }
+                    updateStatusManager.reset()
+                }
+            }.onFailure { error ->
+                if (!silent) {
+                    _uiState.value = _uiState.value.copy(
+                        toastMessage = error.message ?: context.getString(R.string.update_check_failed),
+                        toastType = ToastType.ERROR
+                    )
+                }
+                updateStatusManager.reset()
+            }
+        }
+    }
+
+    private var downloadJob: kotlinx.coroutines.Job? = null
+
+    fun downloadAppUpdate() {
+        val currentStatus = updateStatusManager.status.value
+        val update = when (currentStatus) {
+            is com.arflix.tv.updater.UpdateStatus.UpdateAvailable -> currentStatus.update
+            is com.arflix.tv.updater.UpdateStatus.Failure -> currentStatus.update
+            else -> return
+        } ?: return
+
+        if (!appUpdateRepository.supportsSelfUpdate()) return
+
+        downloadJob = viewModelScope.launch {
+            updateStatusManager.updateStatus(com.arflix.tv.updater.UpdateStatus.Downloading(0f, update))
+
+            val safeName = update.assetName.replace(HomeVMRegexes.FILE_NAME_REGEX, "_")
+            val dest = java.io.File(java.io.File(context.cacheDir, "updates"), safeName)
+
+            val result = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                apkDownloader.download(update.assetUrl, dest) { downloaded, total ->
+                    val progress = if (total != null && total > 0L) {
+                        (downloaded.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+                    } else null
+
+                    updateStatusManager.updateStatus(com.arflix.tv.updater.UpdateStatus.Downloading(progress, update))
+                }
+            }
+
+            result.onSuccess { file ->
+                updateStatusManager.updateStatus(com.arflix.tv.updater.UpdateStatus.ReadyToInstall(file.absolutePath, update))
+                // Automatically prompt install once downloaded
+                installAppUpdateOrRequestPermission()
+            }.onFailure { error ->
+                updateStatusManager.updateStatus(
+                    com.arflix.tv.updater.UpdateStatus.Failure(error.message ?: context.getString(R.string.update_download_failed), update)
+                )
+            }
+        }
+    }
+
+    fun cancelDownloadAppUpdate() {
+        downloadJob?.cancel()
+        downloadJob = null
+        val currentStatus = updateStatusManager.status.value
+        if (currentStatus is com.arflix.tv.updater.UpdateStatus.Downloading) {
+            updateStatusManager.updateStatus(com.arflix.tv.updater.UpdateStatus.UpdateAvailable(currentStatus.update))
+        }
+    }
+
+    fun installAppUpdateOrRequestPermission() {
+        val currentStatus = updateStatusManager.status.value
+        if (currentStatus !is com.arflix.tv.updater.UpdateStatus.ReadyToInstall && currentStatus !is com.arflix.tv.updater.UpdateStatus.Failure) return
+
+        val apkPath = if (currentStatus is com.arflix.tv.updater.UpdateStatus.ReadyToInstall) currentStatus.apkPath else return
+        val update = currentStatus.update
+        val apkFile = java.io.File(apkPath)
+
+        if (!apkFile.exists()) {
+            updateStatusManager.updateStatus(com.arflix.tv.updater.UpdateStatus.Failure("Downloaded file is missing", update))
+            return
+        }
+
+        if (!com.arflix.tv.updater.ApkInstaller.canRequestPackageInstalls(context)) {
+            // If we can't request package installs, we should let the user know, but for now
+            // launchInstall handles falling back to Intent.ACTION_VIEW
+        }
+
+        val conflictMsg = com.arflix.tv.updater.ApkInstaller.checkSignatureConflict(context, apkFile)
+        if (conflictMsg != null) {
+            updateStatusManager.updateStatus(com.arflix.tv.updater.UpdateStatus.Failure(conflictMsg, update))
+            return
+        }
+
+        com.arflix.tv.updater.ApkInstaller.launchInstall(context, apkFile)
+        updateStatusManager.updateStatus(com.arflix.tv.updater.UpdateStatus.Installing(update))
+
+        // Mark this release as ignored so it doesn't pop up again if the user cancels the install
+        viewModelScope.launch {
+            updatePreferences.setIgnoredTag(update.tag)
+        }
+    }
+
+    fun dismissAppUpdateDialog() {
+        _uiState.value = _uiState.value.copy(showAppUpdateDialog = false)
+        // We do not reset updateStatusManager here, so the badge remains active
+    }
+
+    fun ignoreAppUpdate() {
+        val currentStatus = updateStatusManager.status.value
+        if (currentStatus is com.arflix.tv.updater.UpdateStatus.UpdateAvailable) {
+            updateStatusManager.sessionIgnoredTag = currentStatus.update.tag
+            viewModelScope.launch {
+                updatePreferences.setIgnoredTag(currentStatus.update.tag)
+            }
+        }
+        _uiState.value = _uiState.value.copy(showAppUpdateDialog = false, hasUpdateBadge = false)
+        updateStatusManager.reset()
+    }
+}
+
+private object HomeVMRegexes {
+    val ALPHANUMERIC_REGEX = Regex("[^A-Za-z0-9_.-]")
+    val FILE_NAME_REGEX = Regex("[^a-zA-Z0-9._-]")
+}
