@@ -323,6 +323,20 @@ internal object IptvTitleNormalizer {
     }
 }
 
+/** Orbita Play: one IPTV list as seen by the Filmes / Séries catalogue. */
+data class OrbitaVodSource(
+    val id: String,
+    val name: String,
+    val m3uUrl: String,
+    val xtreamBaseUrl: String?,
+    val xtreamUsername: String?,
+    val xtreamPassword: String?,
+    val importMovies: Boolean,
+    val importSeries: Boolean,
+) {
+    val isXtream: Boolean get() = !xtreamBaseUrl.isNullOrBlank() && !xtreamUsername.isNullOrBlank() && !xtreamPassword.isNullOrBlank()
+}
+
 data class IptvConfig(
     val m3uUrl: String = "",
     val epgUrl: String = "",
@@ -885,6 +899,25 @@ class IptvRepository @Inject constructor(
     internal fun hasAnyConfiguredSource(config: IptvConfig): Boolean =
         activePlaylists(config).any { it.m3uUrl.isNotBlank() } ||
             activeStalkerPortals(config).isNotEmpty()
+
+    /**
+     * Orbita Play: the enabled lists, each with its Xtream login when the list has one.
+     * Used by the Filmes / Séries catalogue, which reads VOD straight from the provider.
+     */
+    fun orbitaVodSources(config: IptvConfig): List<OrbitaVodSource> =
+        activePlaylists(config).map { playlist ->
+            val creds = resolveXtreamCredentials(playlist)
+            OrbitaVodSource(
+                id = playlist.id,
+                name = playlist.name,
+                m3uUrl = normalizeStoredIptvUrl(playlist.m3uUrl),
+                xtreamBaseUrl = creds?.baseUrl,
+                xtreamUsername = creds?.username,
+                xtreamPassword = creds?.password,
+                importMovies = playlist.importVod ?: true,
+                importSeries = playlist.importSeries ?: true,
+            )
+        }
 
     internal fun activePlaylists(config: IptvConfig): List<IptvPlaylistEntry> {
         // config.playlists.isEmpty() means the user has never created a playlist entry

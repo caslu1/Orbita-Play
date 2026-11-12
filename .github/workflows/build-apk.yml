@@ -32,8 +32,13 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      - name: Placeholder build configuration
-        run: cp secrets.defaults.properties secrets.properties
+      - name: Build configuration
+        env:
+          TMDB: ${{ secrets.TMDB_API_KEY }}
+        run: |
+          cp secrets.defaults.properties secrets.properties
+          # Chave do TMDB opcional: Settings › Secrets › Actions › TMDB_API_KEY
+          if [ -n "$TMDB" ]; then sed -i "s|^TMDB_API_KEY=.*|TMDB_API_KEY=$TMDB|" secrets.properties; fi
 
       - name: Build
         run: |

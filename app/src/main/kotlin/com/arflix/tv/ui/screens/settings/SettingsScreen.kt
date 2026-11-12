@@ -581,14 +581,9 @@ fun SettingsScreen(
             add("language")
             add("subtitles")
             add("ai_subtitles")
-            add("stream_integrations")
+            // Orbita Play: no add-ons, plugins, add-on catalogues or stream integrations.
             add("iptv")
-            add("stremio")
-            add("catalogs")
             add("home_server")
-            if (BuildConfig.FEATURE_PLUGINS_ENABLED) {
-                add("plugins")
-            }
             add("appearance")
             add("network")
         }

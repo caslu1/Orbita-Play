@@ -102,6 +102,14 @@
             android:value="com.arflix.tv.cast.CastOptionsProvider" />
 
         <!-- Main Activity - Compose Host -->
+        <!-- Orbita Play: player for movies and episodes from the IPTV list -->
+        <activity
+            android:name="com.arflix.tv.orbita.vod.OrbitaVodPlayerActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
         <activity
             android:name=".MainActivity"
             android:banner="@drawable/app_banner"

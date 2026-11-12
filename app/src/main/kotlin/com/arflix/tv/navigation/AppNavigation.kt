@@ -316,6 +316,21 @@ fun AppNavigation(
 
         // Home screen
         composable(Screen.Home.route) {
+            if (!com.arflix.tv.util.LocalDeviceType.current.isTouchDevice()) {
+                // Orbita Play (TV): catalogue read straight from the IPTV list, organised with TMDB.
+                com.arflix.tv.orbita.vod.OrbitaVodTvScreen(
+                    kind = com.arflix.tv.orbita.vod.VodKind.MOVIES,
+                    currentProfile = currentProfile,
+                    onMenu = { item ->
+                        if (item == null) {
+                            onSwitchProfile()
+                            navController.navigateToProfileSelection()
+                        } else com.arflix.tv.ui.components.OrbitaNav.go(item)
+                    },
+                    onOpenIptvSettings = { navigateTopLevel(Screen.Settings.createRoute(initialSection = "iptv")) },
+                )
+                return@composable
+            }
             NavigationRailScreen(navigationRailInset, bottomInset = navigationRailBottomInset) {
               CalendarIdlePreload(calendarViewModel, currentProfile?.id) {
                 HomeScreen(
@@ -376,6 +391,21 @@ fun AppNavigation(
 
         // Orbita Play: "Séries" = home catalog showing only series
         composable(ORBITA_SERIES_ROUTE) {
+            if (!com.arflix.tv.util.LocalDeviceType.current.isTouchDevice()) {
+                // Orbita Play (TV): catalogue read straight from the IPTV list, organised with TMDB.
+                com.arflix.tv.orbita.vod.OrbitaVodTvScreen(
+                    kind = com.arflix.tv.orbita.vod.VodKind.SERIES,
+                    currentProfile = currentProfile,
+                    onMenu = { item ->
+                        if (item == null) {
+                            onSwitchProfile()
+                            navController.navigateToProfileSelection()
+                        } else com.arflix.tv.ui.components.OrbitaNav.go(item)
+                    },
+                    onOpenIptvSettings = { navigateTopLevel(Screen.Settings.createRoute(initialSection = "iptv")) },
+                )
+                return@composable
+            }
             NavigationRailScreen(navigationRailInset, bottomInset = navigationRailBottomInset) {
               CalendarIdlePreload(calendarViewModel, currentProfile?.id) {
                 CompositionLocalProvider(com.arflix.tv.ui.screens.home.LocalHomeSection provides com.arflix.tv.ui.screens.home.HomeSection.SERIES) {
