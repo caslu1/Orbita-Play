@@ -1,3 +1,5 @@
+@file:kotlin.OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+
 package com.arflix.tv.ui.screens.tv.orbita
 
 import android.view.LayoutInflater
