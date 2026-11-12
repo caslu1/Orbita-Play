@@ -15,6 +15,9 @@ concurrency:
   group: build-apk-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   apk:
     name: Build APK
@@ -43,3 +46,18 @@ jobs:
           name: OrbitaPlay-${{ inputs.variant || 'SideloadDebug' }}
           path: app/build/outputs/apk/**/*.apk
           if-no-files-found: error
+
+      # Link direto e fixo do APK:
+      # https://github.com/caslu1/Orbita-Play/releases/download/apk/OrbitaPlay.apk
+      - name: Publish direct APK link
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "$(find app/build/outputs/apk -name '*.apk' | head -n 1)" OrbitaPlay.apk
+          if ! gh release view apk >/dev/null 2>&1; then
+            gh release create apk --prerelease --target "$GITHUB_SHA" \
+              --title "Orbita Play - APK de teste" \
+              --notes "APK gerado automaticamente a cada atualização da branch main."
+          fi
+          gh release upload apk OrbitaPlay.apk --clobber
