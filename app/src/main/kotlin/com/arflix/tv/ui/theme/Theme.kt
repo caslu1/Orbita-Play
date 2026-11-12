@@ -93,7 +93,8 @@ fun ArvioTvTheme(
     content: @Composable () -> Unit
 ) {
     val backgroundDark = if (oledBlackBackground) Color.Black else BackgroundDark
-    val accentColor = accentColorName?.let { accentColorFromName(it) }
+    // Orbita Play: purple accent until the user picks another colour.
+    val accentColor = accentColorName?.let { accentColorFromName(it) } ?: Color(0xFF7B5CFF)
     val colorScheme = darkColorScheme(
         primary = ArcticWhite,
         onPrimary = ArcticBlack,

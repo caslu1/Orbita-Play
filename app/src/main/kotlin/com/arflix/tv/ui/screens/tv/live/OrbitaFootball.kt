@@ -26,3 +26,9 @@ internal fun findOrbitaFootballCategoryId(tree: LiveCategoryTree): String? {
         ?: candidates.firstOrNull { it.id == "g-sports" }?.id
         ?: candidates.firstOrNull { it.iconToken == CategoryIcon.Sport }?.id
 }
+
+/** True when a playlist group name looks like a football group. */
+fun isOrbitaFootballLabel(label: String): Boolean = normalizeLabel(label).let { l -> footballWords.any { it in l } }
+
+/** True when a playlist group name looks like a sports group. */
+fun isOrbitaSportsLabel(label: String): Boolean = normalizeLabel(label).let { l -> sportWords.any { it in l } }

@@ -88,6 +88,14 @@ private fun CalendarIdlePreload(viewModel: ReleaseCalendarViewModel, profileId: 
 /** Orbita Play extra top-level routes. */
 const val ORBITA_SERIES_ROUTE = "series"
 const val ORBITA_FOOTBALL_ROUTE = "football"
+/** ARVIO live player opened full screen from the Orbita channel screen (TV). */
+const val ORBITA_TV_PLAY_ROUTE = "tv_play"
+
+internal fun orbitaTvPlayRoute(channelId: String, streamUrl: String?): String {
+    val enc = android.net.Uri.encode(channelId)
+    val streamEnc = streamUrl?.let { android.net.Uri.encode(it) }
+    return if (streamEnc != null) "$ORBITA_TV_PLAY_ROUTE?channelId=$enc&streamUrl=$streamEnc" else "$ORBITA_TV_PLAY_ROUTE?channelId=$enc"
+}
 
 sealed class Screen(val route: String) {
     data object Login : Screen("login")
@@ -498,6 +506,65 @@ fun AppNavigation(
                     LaunchedEffect(Unit) { navigateHome() }
                     return@NavigationRailScreen
                 }
+                if (!com.arflix.tv.util.LocalDeviceType.current.isTouchDevice()) {
+                    com.arflix.tv.ui.screens.tv.orbita.OrbitaChannelsTvScreen(
+                        currentProfile = currentProfile,
+                        footballMode = false,
+                        onOpenFullscreen = { ch ->
+                            navController.navigate(orbitaTvPlayRoute(ch.id, ch.streamUrl))
+                        },
+                        onNavigateToHome = { navigateHome() },
+                        onNavigateToSearch = { navigateTopLevel(Screen.Search.route) },
+                        onNavigateToWatchlist = { navigateTopLevel(Screen.Watchlist.route) },
+                        onNavigateToSettings = { navigateTopLevel(Screen.Settings.route) },
+                        onNavigateToIptvSettings = { navigateTopLevel(Screen.Settings.createRoute(initialSection = "iptv")) },
+                        onSwitchProfile = {
+                            onSwitchProfile()
+                            navController.navigateToProfileSelection()
+                        },
+                    )
+                    return@NavigationRailScreen
+                }
+                LiveTvScreen(
+                    currentProfile = currentProfile,
+                    initialChannelId = initialChannelId,
+                    initialStreamUrl = initialStreamUrl,
+                    onFullscreenChanged = { tvFullscreen = it; onTvFullscreenChanged(it) },
+                    onSubScreenChanged = { tvHasSubScreen = it; onTvSubScreenChanged(it) },
+                    onNavigateToHome = { navigateHome() },
+                    onNavigateToSearch = { navigateTopLevel(Screen.Search.route) },
+                    onNavigateToWatchlist = { navigateTopLevel(Screen.Watchlist.route) },
+                    onNavigateToSettings = { navigateTopLevel(Screen.Settings.route) },
+                    onNavigateToIptvSettings = { navigateTopLevel(Screen.Settings.createRoute(initialSection = "iptv")) },
+                    onNavigateToDetails = { mediaType, mediaId ->
+                        navController.navigate(Screen.Details.createRoute(mediaType, mediaId))
+                    },
+                    onSwitchProfile = {
+                        onSwitchProfile()
+                        navController.navigateToProfileSelection()
+                    },
+                    onBack = { navController.popBackStack() }
+                )
+            }
+        }
+
+        // Orbita Play: full-screen ARVIO live player (TV)
+        composable(
+            route = "$ORBITA_TV_PLAY_ROUTE?channelId={channelId}&streamUrl={streamUrl}",
+            arguments = listOf(
+                navArgument("channelId") { type = NavType.StringType; nullable = true; defaultValue = null },
+                navArgument("streamUrl") { type = NavType.StringType; nullable = true; defaultValue = null }
+            )
+        ) { backStackEntry ->
+            var tvHasSubScreen by remember { mutableStateOf(false) }
+            var tvFullscreen by remember { mutableStateOf(false) }
+            NavigationRailScreen(navigationRailInset, showRail = !tvHasSubScreen && !tvFullscreen, bottomInset = navigationRailBottomInset) {
+                val initialChannelId = backStackEntry.arguments?.getString("channelId")
+                val initialStreamUrl = backStackEntry.arguments?.getString("streamUrl")
+                if (isKidsProfile) {
+                    LaunchedEffect(Unit) { navigateHome() }
+                    return@NavigationRailScreen
+                }
                 LiveTvScreen(
                     currentProfile = currentProfile,
                     initialChannelId = initialChannelId,
@@ -530,6 +597,25 @@ fun AppNavigation(
                 val initialStreamUrl = backStackEntry.arguments?.getString("streamUrl")
                 if (isKidsProfile) {
                     LaunchedEffect(Unit) { navigateHome() }
+                    return@NavigationRailScreen
+                }
+                if (!com.arflix.tv.util.LocalDeviceType.current.isTouchDevice()) {
+                    com.arflix.tv.ui.screens.tv.orbita.OrbitaChannelsTvScreen(
+                        currentProfile = currentProfile,
+                        footballMode = true,
+                        onOpenFullscreen = { ch ->
+                            navController.navigate(orbitaTvPlayRoute(ch.id, ch.streamUrl))
+                        },
+                        onNavigateToHome = { navigateHome() },
+                        onNavigateToSearch = { navigateTopLevel(Screen.Search.route) },
+                        onNavigateToWatchlist = { navigateTopLevel(Screen.Watchlist.route) },
+                        onNavigateToSettings = { navigateTopLevel(Screen.Settings.route) },
+                        onNavigateToIptvSettings = { navigateTopLevel(Screen.Settings.createRoute(initialSection = "iptv")) },
+                        onSwitchProfile = {
+                            onSwitchProfile()
+                            navController.navigateToProfileSelection()
+                        },
+                    )
                     return@NavigationRailScreen
                 }
                 LiveTvScreen(

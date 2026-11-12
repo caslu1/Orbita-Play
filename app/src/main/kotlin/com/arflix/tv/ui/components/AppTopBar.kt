@@ -200,8 +200,10 @@ private fun TopBarNavChip(
 
     val containerColor by animateColorAsState(
         targetValue = when {
+            // Orbita Play: the open section is a solid purple pill, focus is a lighter pill.
+            isSelected && isFocused -> Color(0xFF9A82FF)
+            isSelected -> Color(0xFF7B5CFF)
             isFocused -> Color.White.copy(alpha = 0.2f)
-            isSelected -> Color.White.copy(alpha = 0.1f)
             else -> Color.Transparent
         },
         animationSpec = tween(if (isFocused) AnimationConstants.DURATION_FAST else 0),
@@ -210,7 +212,7 @@ private fun TopBarNavChip(
     val iconColor by animateColorAsState(
         targetValue = when {
             isFocused -> Color.White  // focused icon stays white (wins over selected)
-            isSelected -> accent  // selected icon gets accent
+            isSelected -> Color.White  // Orbita: white on the purple pill
             else -> Color.White.copy(alpha = 0.62f)
         },
         animationSpec = tween(if (isFocused) AnimationConstants.DURATION_FAST else 0),
@@ -219,7 +221,7 @@ private fun TopBarNavChip(
     val textColor by animateColorAsState(
         targetValue = when {
             isFocused -> Color.White  // focused text stays white (wins over selected)
-            isSelected -> accent  // selected text gets accent
+            isSelected -> Color.White  // Orbita: white on the purple pill
             else -> Color.White.copy(alpha = 0.68f)
         },
         animationSpec = tween(if (isFocused) AnimationConstants.DURATION_FAST else 0),
